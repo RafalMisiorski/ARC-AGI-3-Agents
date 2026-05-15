@@ -97,8 +97,12 @@ def run_one_env(
     extra_args: list[str] | None = None,
 ) -> dict:
     """Run main.py for a single env. Returns per-env result dict."""
+    # sys.executable is the venv interpreter when this script runs under
+    # `uv run`. The venv already has every dep main.py needs, so we invoke
+    # main.py directly -- routing through `uv run` again would shell out
+    # to the system Python which does NOT have uv as an importable module.
     cmd = [
-        sys.executable, "-m", "uv", "run", "main.py",
+        sys.executable, "main.py",
         "--agent", agent,
         "--game", env_id,
     ] + (extra_args or [])
