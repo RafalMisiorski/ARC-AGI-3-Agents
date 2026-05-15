@@ -1,64 +1,62 @@
-"""nh_arc_baseline_v0 -- Claude CLI baseline agent for ARC-AGI-3.
+"""nh_arc_baseline_v0 -- Multi-provider CLI race baseline for ARC-AGI-3.
 
 Phase 0 v0.0 of the operator's plan.
 
-ORIGINAL design: one Claude CLI call per action. ABANDONED on Phase 0 day 1
-because measured cold-start latency is ~3-4 minutes per Claude CLI
-subprocess invocation (NOT the 5-15s the plan assumed). At 80 actions
-that's 4-5h per env, which makes any iteration impossible.
+EVOLUTION LOG
+-------------
+v0.0a (abandoned same day): 1 Claude CLI subprocess per action.
+    Measured cold start ~80s, but second+ planner calls **time out at
+    180s** -- Claude Max 20x throttles after a rapid first call. ~25%
+    success rate, levels_completed=0 after 23 actions.
 
-CURRENT design: **planner-executor split**, brought forward from v0.1.
-One Claude CLI call produces a plan of ``PLAN_LENGTH`` actions; the
-executor pops one per ``choose_action`` invocation; when the queue
-empties (or stuck-state is detected), the planner is re-invoked. This
-trades plan quality for throughput -- 80/6 = ~14 planner calls per env
-at ~3min each = ~40min/env, vs ~4h with the per-action approach.
+v0.0b (current): planner-executor split brought forward from v0.1, and
+    the single Claude planner replaced by a **5-way race**:
 
-We extend ``agents.agent.Agent`` directly (NOT ``LLM`` from
-``llm_agents.py``), because that template is hard-wired to the OpenAI SDK
-(``openai.OpenAIClient``, OpenAI function-calling format, ``o3``/``o4-mini``
-models). Vendor-swapping it for Anthropic is a deeper rewrite than just
-implementing the ABC contract fresh.
+        3 x Claude CLI  (sonnet)   -- 3 separate processes, separate
+                                       Max session slots per NH router
+        1 x Gemini CLI  (flash 2.5) -- 1M context, free subscription
+        1 x Codex CLI   (default)   -- subscription-backed
+
+    Each planner call spawns all 5 processes in parallel. The first one
+    to return a response that parses into >=1 valid action wins; the
+    others are cancelled. This routes around per-provider throttling
+    (any one of 5 finishing fast is enough) and amortises Windows
+    subprocess cold-start across providers.
 
 Architecture
 ------------
-- ``choose_action(frames, latest_frame) -> GameAction``
-    1. If the plan queue is empty, build a planning prompt (latest frame
-       pretty-printed + last N=3 frames as context) asking Claude for a
-       list of up to ``PLAN_LENGTH`` actions to execute next.
-    2. Call Claude CLI via ``_call_claude_sync`` (subprocess.run,
-       stream-json I/O, env-scrubbed) -- mirrors NH's
-       ``scripts/llm_call.py::call_claude`` pattern, no NH imports.
-    3. Parse the response via ``_parse_plan`` (one action per line, tolerant
-       of prose). Fall back to a single ACTION5 on parse failure.
-    4. Pop one action from the queue and return it. Subsequent
-       ``choose_action`` calls drain the queue without invoking Claude
-       until empty.
+* ``choose_action(frames, latest_frame) -> GameAction``
+    1. If the plan queue is empty, build a planner prompt from the latest
+       frame plus N=3 recent frames.
+    2. ``asyncio.run(_call_planner_race(...))`` launches 5 subprocesses,
+       FIRST_COMPLETED-style. Winner returned with (response, provider,
+       latency).
+    3. Parse the winner via ``_parse_plan`` (tolerant regex, multi-line).
+       On total failure, queue gets one ACTION5 and we replan next step.
+    4. Pop one (action, data) and return.
 
-Day-1 instrumentation
----------------------
-Each ``choose_action`` writes one line to
-``logs/baseline_v0_<game>_<ts>.jsonl``:
+We extend ``agents.agent.Agent`` directly, not ``LLM`` from
+``llm_agents.py`` (which is hard-wired to the OpenAI SDK).
 
-* ``planner_invoked`` -- True iff the queue was empty and we called Claude
-  on this step.
-* ``planner_latency_seconds`` / ``plan_size`` / ``parse_ok`` -- only when
-  planner_invoked.
-* ``action_chosen`` / ``queue_depth_after`` -- on every step.
-
-This is the raw data behind the Phase 0 decision gate
-("dev levels_completed >= random + 0.3") and the latency / planner-cadence
-tracking flagged as the single most important risk in the plan.
+Instrumentation per step -> logs/baseline_v0_<game>_<ts>.jsonl
+-------------------------------------------------------------
+* planner_invoked       (bool) -- True iff queue was empty this step
+* race_winner_provider  (str)  -- claude_0/1/2 | gemini | codex | ""
+* race_winner_latency_s (float)
+* race_competitor_latencies (dict provider->float, only those that
+                              finished before the winner was picked)
+* plan_size, parse_ok, action_chosen, queue_depth_after,
+  planner_call_count, response_preview
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import shutil
-import subprocess
 import textwrap
 import time
 from pathlib import Path
@@ -70,10 +68,14 @@ from ..agent import Agent
 
 logger = logging.getLogger(__name__)
 
-_CLAUDE_ENV_SCRUB_KEYS = (
+_CLI_ENV_SCRUB_KEYS = (
+    # Claude
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "ANTHROPIC_API_KEY",
+    # Gemini
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
 )
 
 _ACTION_PATTERN = re.compile(
@@ -82,15 +84,23 @@ _ACTION_PATTERN = re.compile(
 )
 
 
-def _clean_env_for_claude() -> dict[str, str]:
+def _clean_env_for_cli() -> dict[str, str]:
+    """Env-scrub for all CLIs we shell out to (claude, gemini, codex)."""
     env = os.environ.copy()
-    for key in _CLAUDE_ENV_SCRUB_KEYS:
+    for key in _CLI_ENV_SCRUB_KEYS:
         env.pop(key, None)
     return env
 
 
 def _extract_text_from_stream(stdout: str) -> str:
-    """Parse Claude CLI stream-json output, prefer the final result event."""
+    """Parse stream-json / JSONL output from any of the 3 CLI shapes.
+
+    Recognises:
+      Claude: {"type":"result","subtype":"success","result":"..."}     (preferred)
+              {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+      Gemini: {"type":"message","role":"assistant","content":"..."}
+      Codex : {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+    """
     text_parts: list[str] = []
     for line in stdout.strip().split("\n"):
         line = line.strip()
@@ -100,36 +110,58 @@ def _extract_text_from_stream(stdout: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+
+        # Claude final-result event -- authoritative, return immediately.
         if event.get("type") == "result" and event.get("subtype") == "success":
             result = event.get("result", "")
             if isinstance(result, str) and result:
                 return result.strip()
+
+        # Claude streaming assistant blocks.
         if event.get("type") == "assistant":
             msg = event.get("message", {})
-            content = msg.get("content", "") if isinstance(msg, dict) else ""
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-            elif isinstance(content, str):
+            if isinstance(msg, dict):
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            t = block.get("text", "")
+                            if t:
+                                text_parts.append(t)
+                elif isinstance(content, str) and content:
+                    text_parts.append(content)
+
+        # Gemini streaming assistant chunks.
+        if event.get("type") == "message" and event.get("role") == "assistant":
+            content = event.get("content", "")
+            if isinstance(content, str) and content:
                 text_parts.append(content)
-    return "\n".join(p for p in text_parts if p).strip()
+
+        # Codex JSONL agent_message events.
+        if event.get("type") == "item.completed":
+            item = event.get("item", {})
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                t = item.get("text", "")
+                if t:
+                    text_parts.append(t)
+
+    return "".join(text_parts).strip()
 
 
-def _call_claude_sync(
-    prompt: str,
-    model: str = "sonnet",
-    timeout: int = 60,
-) -> tuple[str, float]:
-    """Synchronous Claude CLI call. Returns (response_text, latency_seconds)."""
-    claude_cmd = shutil.which("claude") or shutil.which("claude.cmd")
-    if not claude_cmd:
-        logger.warning("Claude CLI not on PATH; returning empty")
-        return "", 0.0
+# ---------------------------------------------------------------------------
+# Per-provider async wrappers
+# ---------------------------------------------------------------------------
+
+
+async def _call_claude_async(prompt: str, timeout: int) -> str:
+    cmd_path = shutil.which("claude") or shutil.which("claude.cmd")
+    if not cmd_path:
+        logger.warning("Claude CLI not on PATH")
+        return ""
 
     cmd = [
-        claude_cmd,
-        "--model", model,
+        cmd_path,
+        "--model", "sonnet",
         "--output-format", "stream-json",
         "--input-format", "stream-json",
         "--verbose",
@@ -141,39 +173,157 @@ def _call_claude_sync(
         )
         + "\n"
     )
+    return await _run_subprocess(cmd, stdin_msg.encode("utf-8"), timeout)
 
-    t0 = time.time()
+
+async def _call_gemini_async(prompt: str, timeout: int) -> str:
+    cmd_path = shutil.which("gemini") or shutil.which("gemini.cmd")
+    if not cmd_path:
+        logger.warning("Gemini CLI not on PATH")
+        return ""
+    cmd = [cmd_path, "-m", "gemini-2.5-flash", "--output-format", "stream-json"]
+    return await _run_subprocess(cmd, prompt.encode("utf-8"), timeout)
+
+
+async def _call_codex_async(prompt: str, timeout: int) -> str:
+    cmd_path = shutil.which("codex") or shutil.which("codex.cmd")
+    if not cmd_path:
+        logger.warning("Codex CLI not on PATH")
+        return ""
+    cmd = [
+        cmd_path,
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "--sandbox", "read-only",
+    ]
+    return await _run_subprocess(cmd, prompt.encode("utf-8"), timeout)
+
+
+async def _run_subprocess(cmd: list[str], stdin: bytes, timeout: int) -> str:
+    """Async subprocess with hard-kill on timeout."""
     try:
-        proc = subprocess.run(
-            cmd,
-            input=stdin_msg,
-            capture_output=True,
-            text=True,
-            env=_clean_env_for_claude(),
-            timeout=timeout,
-            encoding="utf-8",
-            errors="replace",
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_clean_env_for_cli(),
         )
-        latency = time.time() - t0
-        return _extract_text_from_stream(proc.stdout), latency
-    except subprocess.TimeoutExpired:
-        latency = time.time() - t0
-        logger.warning(f"Claude CLI timeout after {timeout}s")
-        return "", latency
-    except Exception as e:
-        latency = time.time() - t0
-        logger.error(f"Claude CLI error: {e}")
-        return "", latency
+    except (FileNotFoundError, OSError) as e:
+        logger.warning(f"subprocess spawn failed for {cmd[0]}: {e}")
+        return ""
+
+    try:
+        stdout, _stderr = await asyncio.wait_for(
+            proc.communicate(input=stdin), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        for fn in ("kill", "terminate"):
+            try:
+                getattr(proc, fn)()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+        # Drain to release handles.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            pass
+        return ""
+
+    if proc.returncode and proc.returncode != 0:
+        return ""
+    try:
+        text = stdout.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    return _extract_text_from_stream(text)
 
 
-def _pretty_print_grid(grid: list[list[list[Any]]]) -> str:
-    """Render a 3D grid (list of 2D blocks) as compact text."""
-    lines: list[str] = []
-    for i, block in enumerate(grid):
-        lines.append(f"Grid {i}:")
-        for row in block:
-            lines.append("  " + "".join(f"{c:02x}" for c in row))
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# Multi-provider race
+# ---------------------------------------------------------------------------
+
+
+async def _call_planner_race(
+    prompt: str,
+    timeout: int,
+    plan_length: int,
+    claude_replicas: int = 3,
+) -> tuple[str, str, float, dict[str, float]]:
+    """Race ``claude_replicas`` Claude + 1 Gemini + 1 Codex.
+
+    Returns (winning_text, winning_provider, winning_latency_seconds,
+             completed_competitor_latencies_dict).
+
+    "Winner" = first task that returns text parsing into >=1 valid action.
+    All other tasks are cancelled when a winner is picked. If no provider
+    produces a usable plan within ``timeout``, returns ("", "", elapsed, {}).
+    """
+    t0 = time.time()
+
+    providers: list[tuple[str, Any]] = []
+    for i in range(claude_replicas):
+        providers.append((f"claude_{i}", _call_claude_async(prompt, timeout)))
+    providers.append(("gemini", _call_gemini_async(prompt, timeout)))
+    providers.append(("codex", _call_codex_async(prompt, timeout)))
+
+    tasks_by_name: dict[str, asyncio.Task[str]] = {}
+    for name, coro in providers:
+        tasks_by_name[name] = asyncio.create_task(coro, name=name)
+
+    pending = set(tasks_by_name.values())
+    completed_latencies: dict[str, float] = {}
+    winner_text = ""
+    winner_provider = ""
+
+    try:
+        while pending:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=max(1.0, timeout - (time.time() - t0)),
+            )
+            if not done:
+                # outer timeout expired
+                break
+            for t in done:
+                name = t.get_name()
+                completed_latencies[name] = round(time.time() - t0, 2)
+                try:
+                    text = t.result()
+                except Exception as e:
+                    logger.debug(f"provider {name} raised: {e}")
+                    text = ""
+                if winner_text:
+                    continue
+                if not text:
+                    continue
+                if _parse_plan(text, plan_length):
+                    winner_text = text
+                    winner_provider = name
+                    break
+            if winner_text:
+                break
+    finally:
+        for t in pending:
+            t.cancel()
+        # Drain cancellations so we don't leak orphan subprocesses.
+        if pending:
+            try:
+                await asyncio.wait(pending, timeout=2.0)
+            except Exception:
+                pass
+
+    winning_latency = completed_latencies.get(winner_provider, round(time.time() - t0, 2))
+    return winner_text, winner_provider, winning_latency, completed_latencies
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
 
 
 def _parse_action_match(
@@ -194,12 +344,6 @@ def _parse_action_match(
 
 
 def _parse_plan(text: str, max_actions: int) -> list[tuple[GameAction, dict]]:
-    """Parse a Claude response into an ordered list of (action, data) pairs.
-
-    Tolerant: scans the entire response for action tokens, takes the first
-    ``max_actions`` valid ones, ignores intervening prose. Returns empty list
-    on total failure (caller falls back to ACTION5).
-    """
     if not text:
         return []
     out: list[tuple[GameAction, dict]] = []
@@ -213,19 +357,29 @@ def _parse_plan(text: str, max_actions: int) -> list[tuple[GameAction, dict]]:
     return out
 
 
-class NhArcBaselineV0(Agent):
-    """Phase 0 v0.0 baseline. One Claude CLI call per action.
+# ---------------------------------------------------------------------------
+# Agent class
+# ---------------------------------------------------------------------------
 
-    Naming maps to ``--agent=nharcbaselinev0`` on the main.py CLI (auto-
-    derived lowercase classname via ``Agent.__subclasses__()`` in
-    ``agents/__init__.py``).
-    """
+
+def _pretty_print_grid(grid: list[list[list[Any]]]) -> str:
+    """Render a 3D grid (list of 2D blocks) as compact hex rows."""
+    lines: list[str] = []
+    for i, block in enumerate(grid):
+        lines.append(f"Grid {i}:")
+        for row in block:
+            lines.append("  " + "".join(f"{c:02x}" for c in row))
+    return "\n".join(lines)
+
+
+class NhArcBaselineV0(Agent):
+    """v0.0b -- 5-way CLI race planner-executor agent."""
 
     MAX_ACTIONS: int = 80
-    MODEL: str = "sonnet"
-    CALL_TIMEOUT_SECS: int = 180  # raised from 60 -- cold-start CLI takes ~3min
+    PLAN_LENGTH: int = 6
+    PLANNER_TIMEOUT_SECS: int = 240
+    CLAUDE_REPLICAS: int = 3
     FRAME_HISTORY_DEPTH: int = 3
-    PLAN_LENGTH: int = 6  # actions per Claude planner call
     LOG_DIR: str = "logs"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -247,7 +401,9 @@ class NhArcBaselineV0(Agent):
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
         planner_invoked = False
-        planner_latency = 0.0
+        winner_provider = ""
+        winner_latency = 0.0
+        competitor_latencies: dict[str, float] = {}
         plan_size = 0
         parse_ok = True
         response_preview = ""
@@ -256,16 +412,21 @@ class NhArcBaselineV0(Agent):
             planner_invoked = True
             self._planner_call_count += 1
             prompt = self._build_planning_prompt(frames, latest_frame)
-            response, planner_latency = _call_claude_sync(
-                prompt, model=self.MODEL, timeout=self.CALL_TIMEOUT_SECS
+            response, winner_provider, winner_latency, competitor_latencies = (
+                asyncio.run(
+                    _call_planner_race(
+                        prompt,
+                        timeout=self.PLANNER_TIMEOUT_SECS,
+                        plan_length=self.PLAN_LENGTH,
+                        claude_replicas=self.CLAUDE_REPLICAS,
+                    )
+                )
             )
             response_preview = response[:300]
             self._plan_queue = _parse_plan(response, self.PLAN_LENGTH)
             plan_size = len(self._plan_queue)
             parse_ok = plan_size > 0
             if not self._plan_queue:
-                # Total parse failure -- emit one safe ACTION5 and re-plan
-                # on the next step.
                 self._plan_queue = [(GameAction.ACTION5, {})]
 
         action, data = self._plan_queue.pop(0)
@@ -274,7 +435,9 @@ class NhArcBaselineV0(Agent):
 
         self._log_decision(
             planner_invoked=planner_invoked,
-            planner_latency_seconds=planner_latency,
+            race_winner_provider=winner_provider,
+            race_winner_latency_seconds=winner_latency,
+            race_competitor_latencies=competitor_latencies,
             plan_size=plan_size,
             parse_ok=parse_ok,
             action_name=action.name,
@@ -303,7 +466,6 @@ class NhArcBaselineV0(Agent):
             + _pretty_print_grid(latest_frame.frame)
         )
 
-        # available_actions is list[int] of action ids -- resolve via GameAction.from_id.
         avail_names: list[str] = []
         for aid in latest_frame.available_actions or []:
             try:
@@ -358,7 +520,9 @@ class NhArcBaselineV0(Agent):
     def _log_decision(
         self,
         planner_invoked: bool,
-        planner_latency_seconds: float,
+        race_winner_provider: str,
+        race_winner_latency_seconds: float,
+        race_competitor_latencies: dict[str, float],
         plan_size: int,
         parse_ok: bool,
         action_name: str,
@@ -371,7 +535,9 @@ class NhArcBaselineV0(Agent):
             "game_id": self.game_id,
             "action_counter": self.action_counter,
             "planner_invoked": planner_invoked,
-            "planner_latency_seconds": round(planner_latency_seconds, 3),
+            "race_winner_provider": race_winner_provider,
+            "race_winner_latency_seconds": race_winner_latency_seconds,
+            "race_competitor_latencies": race_competitor_latencies,
             "plan_size": plan_size,
             "parse_ok": parse_ok,
             "action_chosen": action_name,
