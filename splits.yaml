@@ -1,0 +1,67 @@
+# ARC-AGI-3 evaluation splits — frozen from Phase 0 day 1.
+#
+# Rule (from plan section "Decisions taken before Phase 0", point 4):
+#   The split is set on day 1 of Phase 0 and NEVER resampled. Any "we
+#   should reshuffle" instinct in later phases is the leakage that the
+#   plan is trying to prevent.
+#
+# Method:
+#   25 environment IDs discovered under environment_files/. Deterministic
+#   shuffle seeded from sha256('|'.join(sorted(env_ids))). First 15 -> train,
+#   next 5 -> dev, last 5 -> holdout.
+#
+# Rationale for 15/5/5 (NOT 30/10/10 as originally planned):
+#   The plan assumed 50 envs based on early exploration. There are 25.
+#   60/20/20 is the closest defensible split. Holdout of 5 envs means a
+#   single env worth ~0.2 levels_completed swing on the mean — small enough
+#   to demand multi-seed evaluation (>=5 seeds) on every holdout peek.
+#
+# Audit trail:
+#   seed_hex:    cfc9b7268c8eeff9
+#   seed_int:    14972699812364742649
+#   created:     2026-05-15
+#   total_envs:  25
+#   split_ratio: 60/20/20
+#
+# Operational rules:
+#   * train  -> full inspection, per-game prompt cards, prompt tuning ok.
+#   * dev    -> aggregate scores only, never per-frame inspection.
+#               >=5 seeds required for any "v_n+1 beats v_n" claim.
+#   * holdout-> peek <=6 times total before submission; each peek logged
+#               in the epistemic-ledger as a registered claim with
+#               provenance = scorecard hash + date.
+#
+# Note: ls20 (LockSmith) lands in TRAIN, which means the upstream
+# GuidedLLM prompt-card in agents/templates/llm_agents.py does not poison
+# dev or holdout for our baseline.
+
+train:
+  - ar25
+  - dc22
+  - ft09
+  - ka59
+  - lp85
+  - ls20
+  - r11l
+  - re86
+  - s5i5
+  - sk48
+  - sp80
+  - tn36
+  - tr87
+  - vc33
+  - wa30
+
+dev:
+  - bp35
+  - cd82
+  - cn04
+  - sb26
+  - sc25
+
+holdout:
+  - g50t
+  - lf52
+  - m0r0
+  - su15
+  - tu93
