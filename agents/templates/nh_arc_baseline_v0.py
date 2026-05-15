@@ -79,9 +79,52 @@ _CLI_ENV_SCRUB_KEYS = (
 )
 
 _ACTION_PATTERN = re.compile(
-    r"\b(RESET|ACTION[1-7])(?:\s*[\(\s]\s*x\s*=\s*(\d+)\s*[,;\s]\s*y\s*=\s*(\d+))?",
+    # Accepts "ACTION6 x=12 y=34", "ACTION6(x=12,y=34)", and bare "ACTION6 12 34".
+    r"\b(RESET|ACTION[1-7])"
+    r"(?:"
+    r"\s*[\(\s]\s*x\s*=\s*(\d+)\s*[,;\s]\s*y\s*=\s*(\d+)"  # x=N y=N form
+    r"|"
+    r"\s+(\d+)\s+(\d+)"                                       # bare N N form
+    r")?",
     re.IGNORECASE,
 )
+
+
+# Per-game-class prompt cards. Keyed by env_id prefix (chars before '-').
+# Plan rule: cap at <=8 cards total, or the agent becomes a lookup table.
+# Source: agents/templates/llm_agents.py::GuidedLLM (LockSmith rules) --
+# the upstream framework already encoded these for OpenAI o3 GuidedLLM. We
+# vendor them here for our race-based agent.
+GAME_CARDS: dict[str, str] = {
+    "ls20": (
+        "You are playing **LockSmith**. Rules and strategy:\n"
+        "* ACTION1=move up, ACTION2=move down, ACTION3=move left, "
+        "ACTION4=move right. ACTION5/6/7 do nothing in this game.\n"
+        "* Goal: find a key that matches the one inside the exit door, "
+        "then walk into the door.\n"
+        "* 6 levels total; `levels_completed` shows current progress.\n"
+        "* Each level starts with limited energy. Moving consumes energy; "
+        "GAME_OVER if you run out. Refill at 2x2 squares of value 0x06.\n"
+        "* Player is a 4x4 sprite of value 0x04 (with one transparent row).\n"
+        "* Walls = 0x0a (cannot pass). Floor = 0x08 (walkable).\n"
+        "* Current key shape/color shown in bottom-left of grid.\n"
+        "* Exit door is 4x4 with 0x0b border, contains target key (scaled 2x).\n"
+        "* Key-shape rotator: 4x4 with 0x09 + 0x04 in top-left. Step on to "
+        "rotate shape.\n"
+        "* Key-color rotator: 4x4 with 0x09 + 0x02 in bottom-left. Step on "
+        "to rotate color.\n"
+        "* To rotate more than once: step off the rotator, then step back on.\n"
+        "* If the grid does not change after a move, you bumped into a wall."
+    ),
+}
+
+
+def _card_for_game(game_id: str) -> str:
+    """Return the per-game prompt card if we have one, else ''."""
+    if not game_id:
+        return ""
+    key = game_id.split("-", 1)[0]
+    return GAME_CARDS.get(key, "")
 
 
 def _clean_env_for_cli() -> dict[str, str]:
@@ -335,11 +378,15 @@ def _parse_action_match(
     except Exception:
         return None
     data: dict = {}
-    if name == "ACTION6" and m.group(2) and m.group(3):
-        try:
-            data = {"x": str(int(m.group(2))), "y": str(int(m.group(3)))}
-        except ValueError:
-            data = {}
+    if name == "ACTION6":
+        # x=N y=N form (groups 2,3) or bare N N form (groups 4,5)
+        x_str = m.group(2) or m.group(4)
+        y_str = m.group(3) or m.group(5)
+        if x_str and y_str:
+            try:
+                data = {"x": str(int(x_str)), "y": str(int(y_str))}
+            except ValueError:
+                data = {}
     return action, data
 
 
@@ -391,6 +438,7 @@ class NhArcBaselineV0(Agent):
         )
         self._plan_queue: list[tuple[GameAction, dict]] = []
         self._planner_call_count: int = 0
+        self._action_history: list[str] = []  # all actions taken, in order
 
     def is_done(
         self, frames: list[FrameData], latest_frame: FrameData
@@ -432,6 +480,13 @@ class NhArcBaselineV0(Agent):
         action, data = self._plan_queue.pop(0)
         if data:
             action.set_data({**data, "game_id": self.game_id})
+
+        if data:
+            self._action_history.append(
+                f"{action.name} x={data.get('x','?')} y={data.get('y','?')}"
+            )
+        else:
+            self._action_history.append(action.name)
 
         self._log_decision(
             planner_invoked=planner_invoked,
@@ -476,6 +531,28 @@ class NhArcBaselineV0(Agent):
             "RESET, ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6, ACTION7"
         )
 
+        # Build action history section — last 20 actions taken so far.
+        action_hist = self._action_history[-20:]
+        if action_hist:
+            action_hist_block = (
+                f"# ACTIONS TAKEN SO FAR (last {len(action_hist)} of "
+                f"{len(self._action_history)} total)\n"
+                + ", ".join(action_hist)
+                + "\n(Avoid repeating sequences that have not changed the game state.)"
+            )
+        else:
+            action_hist_block = "# ACTIONS TAKEN SO FAR\n(none yet)"
+
+        # Per-game-class card (LockSmith, etc.) -- inserted as prominent
+        # section near the top so the planner doesn't have to rediscover
+        # game-specific mechanics in <80 actions.
+        card_text = _card_for_game(self.game_id)
+        card_block = (
+            f"# GAME-SPECIFIC NOTES\n{card_text}\n"
+            if card_text
+            else ""
+        )
+
         return textwrap.dedent(
             f"""\
             # ROLE
@@ -485,6 +562,7 @@ class NhArcBaselineV0(Agent):
             reach state=WIN while minimizing actions and avoiding
             GAME_OVER.
 
+            {card_block}
             # AVAILABLE ACTIONS
             {avail}
 
@@ -492,6 +570,8 @@ class NhArcBaselineV0(Agent):
             (x, y) where both are integers in [0, 63]. RESET starts or
             restarts the game (use as the first action when
             state=NOT_PLAYED, and after GAME_OVER if you want to retry).
+
+            {action_hist_block}
 
             # RECENT HISTORY (last {history_depth} frames before current)
             {chr(10).join(history_blocks) if history_blocks else '(no prior frames)'}
@@ -543,6 +623,7 @@ class NhArcBaselineV0(Agent):
             "action_chosen": action_name,
             "queue_depth_after": queue_depth_after,
             "planner_call_count": planner_call_count,
+            "game_card_used": bool(_card_for_game(self.game_id)),
             "response_preview": response_preview if planner_invoked else "",
         }
         try:
