@@ -150,13 +150,70 @@ def run_one_env(
     }
 
 
+def _cost_for_game(env_id: str) -> tuple[float, dict[str, float]]:
+    """Sum cost_burn.jsonl rows for one env. Returns (usd, by_provider).
+
+    eval_local.py imports cost_tracker lazily so the module also works on
+    boxes that don't have the tracker installed yet.
+    """
+    try:
+        from agents.templates.cost_tracker import session_cost_summary
+    except Exception:
+        return 0.0, {}
+    # game_id in cost_burn.jsonl is the FULL framework-issued id (e.g.
+    # "ls20-9607627b"), not the bare env prefix "ls20". Fold both shapes.
+    try:
+        # Direct match on prefix-only key first.
+        summary = session_cost_summary(env_id)
+        if summary.get("calls", 0) > 0:
+            return summary["total_usd"], summary["by_provider"]
+    except Exception:
+        pass
+    # Fallback: scan log for any game_id starting with env_id-
+    try:
+        from agents.templates.cost_tracker import get_log_path
+        import json as _json
+        path = get_log_path()
+        if not path.is_file():
+            return 0.0, {}
+        total = 0.0
+        by_provider: dict[str, float] = {}
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                gid = rec.get("game_id", "")
+                if gid != env_id and not gid.startswith(env_id + "-"):
+                    continue
+                cost = float(rec.get("estimated_overage_usd") or 0.0)
+                total += cost
+                prov = str(rec.get("backend") or "").replace("_cli", "") or "unknown"
+                by_provider[prov] = by_provider.get(prov, 0.0) + cost
+        return round(total, 4), {k: round(v, 4) for k, v in by_provider.items()}
+    except Exception:
+        return 0.0, {}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["dev", "train", "holdout"], required=True)
     ap.add_argument("--agent", default="nharcbaselinev0")
     ap.add_argument(
-        "--timeout-per-env", type=int, default=900,
-        help="Per-env wall-clock cap in seconds (default 900 = 15 min).",
+        "--timeout-per-env", type=int, default=1800,
+        help="Per-env wall-clock cap in seconds (default 1800 = 30 min). "
+             "Day 1 used 900 and killed 4/5 envs mid-flight; agent's internal "
+             "budget cap stops earlier when needed.",
+    )
+    ap.add_argument(
+        "--cap-usd-per-env", type=float, default=5.0,
+        help="Expected $/env hard cap (matches agent's BUDGET_HARD_USD). "
+             "Sweep aborts early if cumulative spend exceeds 2x this times the "
+             "number of envs scheduled.",
     )
     ap.add_argument(
         "--dry-run", action="store_true",
@@ -180,39 +237,72 @@ def main() -> None:
     ts = time.strftime("%Y%m%d_%H%M%S")
     out_path = RESULTS_DIR / f"eval_{args.split}_{args.agent}_{ts}.jsonl"
 
-    print(f"split={args.split} agent={args.agent} envs={len(envs)} timeout/env={args.timeout_per_env}s")
+    sweep_cap_usd = args.cap_usd_per_env * len(envs)
+    abort_threshold_usd = 2.0 * sweep_cap_usd
+
+    print(
+        f"split={args.split} agent={args.agent} envs={len(envs)} "
+        f"timeout/env={args.timeout_per_env}s  per-env-cap=${args.cap_usd_per_env:.2f}  "
+        f"sweep-cap=${sweep_cap_usd:.2f}  abort-at=${abort_threshold_usd:.2f}"
+    )
     print(f"writing to {out_path}")
     print()
 
     results: list[dict] = []
+    cumulative_cost_usd = 0.0
+    aborted = False
+
     with out_path.open("w", encoding="utf-8") as f:
         for i, env_id in enumerate(envs, 1):
             print(f"[{i}/{len(envs)}] {env_id} ... ", end="", flush=True)
             r = run_one_env(args.agent, env_id, args.timeout_per_env)
+
+            # Pull this env's cost from cost_burn.jsonl (written by agent).
+            env_cost_usd, env_by_provider = _cost_for_game(env_id)
+            r["cost_usd"] = env_cost_usd
+            r["cost_by_provider"] = env_by_provider
+            cumulative_cost_usd += env_cost_usd
+            r["cumulative_cost_usd"] = round(cumulative_cost_usd, 4)
+
             results.append(r)
             f.write(json.dumps(r) + "\n")
             f.flush()
+
             print(
                 f"levels={r['levels_completed']} actions={r['actions']} "
-                f"state={r['state']} elapsed={r['elapsed_seconds']:.0f}s"
+                f"state={r['state']} elapsed={r['elapsed_seconds']:.0f}s "
+                f"cost=${env_cost_usd:.4f}  cumulative=${cumulative_cost_usd:.4f}"
             )
             if r["scorecard_url"]:
                 print(f"        scorecard: {r['scorecard_url']}")
 
+            if cumulative_cost_usd > abort_threshold_usd:
+                aborted = True
+                print(
+                    f"\n[SWEEP ABORT] cumulative ${cumulative_cost_usd:.4f} "
+                    f"> 2x sweep cap ${sweep_cap_usd:.2f}. Skipping remaining "
+                    f"{len(envs) - i} env(s)."
+                )
+                break
+
     # Summary
     print()
     print("=" * 60)
-    print(f"split={args.split} agent={args.agent}")
-    print(f"envs run:           {len(results)}")
+    print(f"split={args.split} agent={args.agent}{'  (ABORTED)' if aborted else ''}")
+    print(f"envs run:           {len(results)} of {len(envs)}")
     completed = [r["levels_completed"] for r in results if r["parsed_scorecard"]]
     if completed:
         mean = sum(completed) / len(completed)
         print(f"mean levels_completed: {mean:.2f}")
-        print(f"per env:              {dict(zip([r['env_id'] for r in results], completed))}")
+        print(f"per env levels:        {dict(zip([r['env_id'] for r in results], completed))}")
     else:
         print("No parseable scorecards -- check stdout for failures.")
-    print(f"total wall-clock:     {sum(r['elapsed_seconds'] for r in results):.0f}s")
-    print(f"results jsonl:        {out_path}")
+    print(f"total wall-clock:      {sum(r['elapsed_seconds'] for r in results):.0f}s")
+    print(f"total cost:            ${cumulative_cost_usd:.4f} "
+          f"(~EUR {cumulative_cost_usd * 0.88:.2f})")
+    print(f"per env cost:          {dict(zip([r['env_id'] for r in results], [r['cost_usd'] for r in results]))}")
+    print(f"results jsonl:         {out_path}")
+    print(f"cost detail jsonl:     logs/cost_burn.jsonl")
 
 
 if __name__ == "__main__":

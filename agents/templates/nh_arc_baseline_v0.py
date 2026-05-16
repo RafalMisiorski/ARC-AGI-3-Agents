@@ -1,52 +1,63 @@
-"""nh_arc_baseline_v0 -- Multi-provider CLI race baseline for ARC-AGI-3.
+"""nh_arc_baseline_v0 -- Cost-aware sequential cascade planner for ARC-AGI-3.
 
 Phase 0 v0.0 of the operator's plan.
 
 EVOLUTION LOG
 -------------
 v0.0a (abandoned same day): 1 Claude CLI subprocess per action.
-    Measured cold start ~80s, but second+ planner calls **time out at
-    180s** -- Claude Max 20x throttles after a rapid first call. ~25%
-    success rate, levels_completed=0 after 23 actions.
+    ~3-4 min cold-start per call -> 4-5h per env. Unworkable.
 
-v0.0b (current): planner-executor split brought forward from v0.1, and
-    the single Claude planner replaced by a **5-way race**:
+v0.0b (abandoned next morning): planner-executor + 5-way race
+    (3 Claude + Gemini + Codex). Achieved first scoring level on ls20
+    (1/7 levels) but **burned 170 EUR of the 180 EUR monthly Extra-Usage
+    cap in a single day** because cancelled-but-issued Claude requests
+    still pay against Anthropic API.
 
-        3 x Claude CLI  (sonnet)   -- 3 separate processes, separate
-                                       Max session slots per NH router
-        1 x Gemini CLI  (flash 2.5) -- 1M context, free subscription
-        1 x Codex CLI   (default)   -- subscription-backed
+v0.0c (current): **sequential cascade** -- one provider at a time,
+    falling through to the next only when the current returns empty or
+    unparseable output. Backed by per-call cost tracking via
+    ``cost_tracker.py`` and per-game soft/hard budget caps.
 
-    Each planner call spawns all 5 processes in parallel. The first one
-    to return a response that parses into >=1 valid action wins; the
-    others are cancelled. This routes around per-provider throttling
-    (any one of 5 finishing fast is enough) and amortises Windows
-    subprocess cold-start across providers.
+Order (empirical from Day 1, not plan-agent guess):
+    1. Codex CLI (default model)    -- cheapest tier-1, fastest when fresh
+    2. Claude CLI (sonnet)           -- deepest reasoning, used only when
+                                        Codex fails AND budget allows
+    3. Gemini CLI (flash 2.5)        -- free, shallow; last resort
 
 Architecture
 ------------
 * ``choose_action(frames, latest_frame) -> GameAction``
     1. If the plan queue is empty, build a planner prompt from the latest
        frame plus N=3 recent frames.
-    2. ``asyncio.run(_call_planner_race(...))`` launches 5 subprocesses,
-       FIRST_COMPLETED-style. Winner returned with (response, provider,
-       latency).
+    2. ``asyncio.run(_call_planner_cascade(...))`` tries each provider
+       in CASCADE_ORDER, returning ``(provider, model, text, usage,
+       duration_s, per_provider_durations)`` on first parseable plan.
     3. Parse the winner via ``_parse_plan`` (tolerant regex, multi-line).
        On total failure, queue gets one ACTION5 and we replan next step.
-    4. Pop one (action, data) and return.
+    4. Record the winning call's cost via ``cost_tracker.record_call``.
+    5. If cumulative game cost > BUDGET_SOFT_USD, log warning. If >
+       BUDGET_HARD_USD, set ``_budget_exceeded`` so the next ``is_done``
+       returns True -- agent ends cleanly with scorecard.
+    6. Pop one (action, data) and return.
 
 We extend ``agents.agent.Agent`` directly, not ``LLM`` from
 ``llm_agents.py`` (which is hard-wired to the OpenAI SDK).
 
 Instrumentation per step -> logs/baseline_v0_<game>_<ts>.jsonl
 -------------------------------------------------------------
-* planner_invoked       (bool) -- True iff queue was empty this step
-* race_winner_provider  (str)  -- claude_0/1/2 | gemini | codex | ""
-* race_winner_latency_s (float)
-* race_competitor_latencies (dict provider->float, only those that
-                              finished before the winner was picked)
+* planner_invoked                  (bool)
+* cascade_winner_provider          (str) -- codex | claude | gemini | ""
+* cascade_winner_model             (str) -- sonnet, codex_default, etc.
+* cascade_winner_duration_s        (float)
+* cascade_per_provider_durations   (dict, only tiers we attempted)
 * plan_size, parse_ok, action_chosen, queue_depth_after,
-  planner_call_count, response_preview
+  planner_call_count, response_preview, game_card_used
+* last_call_cost_usd               (float, this step's cost)
+* total_game_cost_usd              (float, running total this game)
+* budget_state                     ("ok" | "soft_warning" | "hard_stop")
+
+A parallel log goes to logs/cost_burn.jsonl (one row per CLI call,
+mirroring NH's opus_credit_burn.jsonl schema -- see cost_tracker.py).
 """
 
 from __future__ import annotations
@@ -65,6 +76,7 @@ from typing import Any
 from arcengine import FrameData, GameAction, GameState
 
 from ..agent import Agent
+from . import cost_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -135,16 +147,50 @@ def _clean_env_for_cli() -> dict[str, str]:
     return env
 
 
-def _extract_text_from_stream(stdout: str) -> str:
-    """Parse stream-json / JSONL output from any of the 3 CLI shapes.
+def _extract_text_and_usage(stdout: str) -> tuple[str, dict[str, int]]:
+    """Parse stream-json / JSONL output. Returns (text, usage_dict).
 
-    Recognises:
+    Recognises text from:
       Claude: {"type":"result","subtype":"success","result":"..."}     (preferred)
               {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
       Gemini: {"type":"message","role":"assistant","content":"..."}
       Codex : {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+
+    Recognises usage tokens from:
+      Claude: result.usage.{input_tokens, output_tokens, cache_read_input_tokens,
+              cache_creation_input_tokens}
+      Codex : turn.completed.usage.{input_tokens, output_tokens,
+              cached_input_tokens}   -- or item.completed.usage
+      Gemini: message.usage_metadata.{prompt_token_count, candidates_token_count}
+              (Gemini's tag names differ; we normalise on the way out)
     """
     text_parts: list[str] = []
+    usage: dict[str, int] = {}
+    final_text: str | None = None
+
+    def _merge_usage(u: dict | None) -> None:
+        if not isinstance(u, dict):
+            return
+        # Anthropic-style keys.
+        if u.get("input_tokens") is not None:
+            usage["input_tokens"] = int(u["input_tokens"])
+        if u.get("output_tokens") is not None:
+            usage["output_tokens"] = int(u["output_tokens"])
+        if u.get("cache_read_input_tokens") is not None:
+            usage["cache_read_tokens"] = int(u["cache_read_input_tokens"])
+        elif u.get("cached_input_tokens") is not None:  # Codex spelling
+            usage["cache_read_tokens"] = int(u["cached_input_tokens"])
+        if u.get("cache_creation_input_tokens") is not None:
+            usage["cache_creation_tokens"] = int(u["cache_creation_input_tokens"])
+        # Gemini-style aliases.
+        if u.get("prompt_token_count") is not None and "input_tokens" not in usage:
+            usage["input_tokens"] = int(u["prompt_token_count"])
+        if (
+            u.get("candidates_token_count") is not None
+            and "output_tokens" not in usage
+        ):
+            usage["output_tokens"] = int(u["candidates_token_count"])
+
     for line in stdout.strip().split("\n"):
         line = line.strip()
         if not line:
@@ -154,11 +200,12 @@ def _extract_text_from_stream(stdout: str) -> str:
         except json.JSONDecodeError:
             continue
 
-        # Claude final-result event -- authoritative, return immediately.
+        # Claude final-result event -- authoritative for text.
         if event.get("type") == "result" and event.get("subtype") == "success":
             result = event.get("result", "")
             if isinstance(result, str) and result:
-                return result.strip()
+                final_text = result.strip()
+            _merge_usage(event.get("usage"))
 
         # Claude streaming assistant blocks.
         if event.get("type") == "assistant":
@@ -173,12 +220,14 @@ def _extract_text_from_stream(stdout: str) -> str:
                                 text_parts.append(t)
                 elif isinstance(content, str) and content:
                     text_parts.append(content)
+                _merge_usage(msg.get("usage"))
 
         # Gemini streaming assistant chunks.
         if event.get("type") == "message" and event.get("role") == "assistant":
             content = event.get("content", "")
             if isinstance(content, str) and content:
                 text_parts.append(content)
+            _merge_usage(event.get("usage") or event.get("usage_metadata"))
 
         # Codex JSONL agent_message events.
         if event.get("type") == "item.completed":
@@ -187,8 +236,14 @@ def _extract_text_from_stream(stdout: str) -> str:
                 t = item.get("text", "")
                 if t:
                     text_parts.append(t)
+            _merge_usage((item or {}).get("usage"))
 
-    return "".join(text_parts).strip()
+        # Codex final usage on turn.completed.
+        if event.get("type") == "turn.completed":
+            _merge_usage(event.get("usage"))
+
+    text = final_text if final_text is not None else "".join(text_parts).strip()
+    return text, usage
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +251,12 @@ def _extract_text_from_stream(stdout: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _call_claude_async(prompt: str, timeout: int) -> str:
+async def _call_claude_async(prompt: str, timeout: int) -> tuple[str, dict[str, int], float]:
+    """Returns (text, usage_dict, duration_s)."""
     cmd_path = shutil.which("claude") or shutil.which("claude.cmd")
     if not cmd_path:
         logger.warning("Claude CLI not on PATH")
-        return ""
+        return "", {}, 0.0
 
     cmd = [
         cmd_path,
@@ -219,20 +275,22 @@ async def _call_claude_async(prompt: str, timeout: int) -> str:
     return await _run_subprocess(cmd, stdin_msg.encode("utf-8"), timeout)
 
 
-async def _call_gemini_async(prompt: str, timeout: int) -> str:
+async def _call_gemini_async(prompt: str, timeout: int) -> tuple[str, dict[str, int], float]:
+    """Returns (text, usage_dict, duration_s)."""
     cmd_path = shutil.which("gemini") or shutil.which("gemini.cmd")
     if not cmd_path:
         logger.warning("Gemini CLI not on PATH")
-        return ""
+        return "", {}, 0.0
     cmd = [cmd_path, "-m", "gemini-2.5-flash", "--output-format", "stream-json"]
     return await _run_subprocess(cmd, prompt.encode("utf-8"), timeout)
 
 
-async def _call_codex_async(prompt: str, timeout: int) -> str:
+async def _call_codex_async(prompt: str, timeout: int) -> tuple[str, dict[str, int], float]:
+    """Returns (text, usage_dict, duration_s)."""
     cmd_path = shutil.which("codex") or shutil.which("codex.cmd")
     if not cmd_path:
         logger.warning("Codex CLI not on PATH")
-        return ""
+        return "", {}, 0.0
     cmd = [
         cmd_path,
         "exec",
@@ -243,8 +301,11 @@ async def _call_codex_async(prompt: str, timeout: int) -> str:
     return await _run_subprocess(cmd, prompt.encode("utf-8"), timeout)
 
 
-async def _run_subprocess(cmd: list[str], stdin: bytes, timeout: int) -> str:
-    """Async subprocess with hard-kill on timeout."""
+async def _run_subprocess(
+    cmd: list[str], stdin: bytes, timeout: int
+) -> tuple[str, dict[str, int], float]:
+    """Async subprocess with hard-kill on timeout. Returns (text, usage, duration_s)."""
+    t0 = time.time()
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -255,7 +316,7 @@ async def _run_subprocess(cmd: list[str], stdin: bytes, timeout: int) -> str:
         )
     except (FileNotFoundError, OSError) as e:
         logger.warning(f"subprocess spawn failed for {cmd[0]}: {e}")
-        return ""
+        return "", {}, time.time() - t0
 
     try:
         stdout, _stderr = await asyncio.wait_for(
@@ -269,99 +330,92 @@ async def _run_subprocess(cmd: list[str], stdin: bytes, timeout: int) -> str:
                 pass
             except Exception:
                 pass
-        # Drain to release handles.
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:
             pass
-        return ""
+        return "", {}, time.time() - t0
 
+    duration = time.time() - t0
     if proc.returncode and proc.returncode != 0:
-        return ""
+        return "", {}, duration
     try:
-        text = stdout.decode("utf-8", errors="replace")
+        text_raw = stdout.decode("utf-8", errors="replace")
     except Exception:
-        return ""
-    return _extract_text_from_stream(text)
+        return "", {}, duration
+    text, usage = _extract_text_and_usage(text_raw)
+    return text, usage, duration
 
 
 # ---------------------------------------------------------------------------
-# Multi-provider race
+# Sequential cascade planner -- Codex first, Claude reserve, Gemini last
 # ---------------------------------------------------------------------------
+#
+# Day 1 of Phase 0 burned 170 EUR running a 5-way race (3 Claude + Gemini +
+# Codex) because cancelled Claude replicas STILL pay -- asyncio.cancel does
+# not refund an already-issued API call. Day 2 architecture: try one
+# provider at a time, only fall through to the next when the current one
+# produces empty or unparseable output.
+#
+# Empirics from Day 1: in the one successful ls20 run (1 level completed),
+# Codex won 22/24 plan calls, Gemini gave spam-move plans, Claude was
+# bimodal. Order reflects this -- Codex first because cheapest tier-1 and
+# fastest when fresh, Claude reserve because deepest reasoning when
+# available, Gemini last resort because shallow but free.
+
+CASCADE_ORDER: list[tuple[str, str, int, float]] = [
+    # (provider, model_for_pricing, timeout_secs, min_budget_remaining_usd)
+    ("codex",  "codex_default",     30, 0.05),   # cheapest, ~5s typical
+    ("claude", "sonnet",            90, 0.50),   # bimodal latency, expensive
+    ("gemini", "gemini-flash-2.5",  60, 0.0),    # free, always tried last
+]
 
 
-async def _call_planner_race(
+async def _call_planner_cascade(
     prompt: str,
-    timeout: int,
     plan_length: int,
-    claude_replicas: int = 3,
-) -> tuple[str, str, float, dict[str, float]]:
-    """Race ``claude_replicas`` Claude + 1 Gemini + 1 Codex.
+    budget_remaining_usd: float,
+) -> tuple[str, str, str, dict[str, int], float, dict[str, float]]:
+    """Try providers in CASCADE_ORDER until one returns a parseable plan.
 
-    Returns (winning_text, winning_provider, winning_latency_seconds,
-             completed_competitor_latencies_dict).
+    Returns:
+        (provider, model, text, usage_dict, winning_duration_s,
+         per_provider_durations)
 
-    "Winner" = first task that returns text parsing into >=1 valid action.
-    All other tasks are cancelled when a winner is picked. If no provider
-    produces a usable plan within ``timeout``, returns ("", "", elapsed, {}).
+    ``provider`` is "" if everything failed. ``per_provider_durations``
+    holds the durations of EVERY tier we actually attempted (useful for
+    diagnosing which tier carries the agent).
     """
-    t0 = time.time()
+    per_provider_durations: dict[str, float] = {}
 
-    providers: list[tuple[str, Any]] = []
-    for i in range(claude_replicas):
-        providers.append((f"claude_{i}", _call_claude_async(prompt, timeout)))
-    providers.append(("gemini", _call_gemini_async(prompt, timeout)))
-    providers.append(("codex", _call_codex_async(prompt, timeout)))
-
-    tasks_by_name: dict[str, asyncio.Task[str]] = {}
-    for name, coro in providers:
-        tasks_by_name[name] = asyncio.create_task(coro, name=name)
-
-    pending = set(tasks_by_name.values())
-    completed_latencies: dict[str, float] = {}
-    winner_text = ""
-    winner_provider = ""
-
-    try:
-        while pending:
-            done, pending = await asyncio.wait(
-                pending,
-                return_when=asyncio.FIRST_COMPLETED,
-                timeout=max(1.0, timeout - (time.time() - t0)),
+    for provider, model, timeout, min_budget in CASCADE_ORDER:
+        if budget_remaining_usd < min_budget:
+            logger.warning(
+                f"cascade: skipping {provider} -- budget ${budget_remaining_usd:.4f} "
+                f"< min ${min_budget:.2f}"
             )
-            if not done:
-                # outer timeout expired
-                break
-            for t in done:
-                name = t.get_name()
-                completed_latencies[name] = round(time.time() - t0, 2)
-                try:
-                    text = t.result()
-                except Exception as e:
-                    logger.debug(f"provider {name} raised: {e}")
-                    text = ""
-                if winner_text:
-                    continue
-                if not text:
-                    continue
-                if _parse_plan(text, plan_length):
-                    winner_text = text
-                    winner_provider = name
-                    break
-            if winner_text:
-                break
-    finally:
-        for t in pending:
-            t.cancel()
-        # Drain cancellations so we don't leak orphan subprocesses.
-        if pending:
-            try:
-                await asyncio.wait(pending, timeout=2.0)
-            except Exception:
-                pass
+            continue
 
-    winning_latency = completed_latencies.get(winner_provider, round(time.time() - t0, 2))
-    return winner_text, winner_provider, winning_latency, completed_latencies
+        if provider == "codex":
+            text, usage, duration = await _call_codex_async(prompt, timeout)
+        elif provider == "claude":
+            text, usage, duration = await _call_claude_async(prompt, timeout)
+        elif provider == "gemini":
+            text, usage, duration = await _call_gemini_async(prompt, timeout)
+        else:
+            continue
+
+        per_provider_durations[provider] = round(duration, 2)
+
+        if text and _parse_plan(text, plan_length):
+            return provider, model, text, usage, duration, per_provider_durations
+
+        # Provider returned empty or unparseable text -- fall through to
+        # the next one. ``usage`` may still be non-empty here (we paid for
+        # the call); the caller is responsible for logging the failed-call
+        # cost via record_call before re-trying.
+
+    return "", "", "", {}, 0.0, per_provider_durations
 
 
 # ---------------------------------------------------------------------------
@@ -420,14 +474,20 @@ def _pretty_print_grid(grid: list[list[list[Any]]]) -> str:
 
 
 class NhArcBaselineV0(Agent):
-    """v0.0b -- 5-way CLI race planner-executor agent."""
+    """v0.0c -- sequential cascade planner-executor with budget enforcement.
+
+    Day 2 retrofit after Day 1 burned 170 EUR via the 3-Claude race.
+    See module docstring + plan file UPDATE 2026-05-16 section.
+    """
 
     MAX_ACTIONS: int = 80
     PLAN_LENGTH: int = 6
-    PLANNER_TIMEOUT_SECS: int = 240
-    CLAUDE_REPLICAS: int = 3
     FRAME_HISTORY_DEPTH: int = 3
     LOG_DIR: str = "logs"
+
+    # Budget caps per game (operator-confirmed 2026-05-16).
+    BUDGET_SOFT_USD: float = 2.0
+    BUDGET_HARD_USD: float = 5.0
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -438,11 +498,18 @@ class NhArcBaselineV0(Agent):
         )
         self._plan_queue: list[tuple[GameAction, dict]] = []
         self._planner_call_count: int = 0
-        self._action_history: list[str] = []  # all actions taken, in order
+        self._action_history: list[str] = []
+
+        # Budget state.
+        self._game_cost_usd: float = 0.0
+        self._soft_warned: bool = False
+        self._budget_exceeded: bool = False
 
     def is_done(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> bool:
+        if self._budget_exceeded:
+            return True
         return latest_frame.state is GameState.WIN
 
     def choose_action(
@@ -450,32 +517,79 @@ class NhArcBaselineV0(Agent):
     ) -> GameAction:
         planner_invoked = False
         winner_provider = ""
-        winner_latency = 0.0
-        competitor_latencies: dict[str, float] = {}
+        winner_model = ""
+        winner_duration_s = 0.0
+        per_provider_durations: dict[str, float] = {}
         plan_size = 0
         parse_ok = True
         response_preview = ""
+        last_call_cost_usd = 0.0
+        budget_state = "ok"
 
         if not self._plan_queue:
             planner_invoked = True
             self._planner_call_count += 1
             prompt = self._build_planning_prompt(frames, latest_frame)
-            response, winner_provider, winner_latency, competitor_latencies = (
-                asyncio.run(
-                    _call_planner_race(
-                        prompt,
-                        timeout=self.PLANNER_TIMEOUT_SECS,
-                        plan_length=self.PLAN_LENGTH,
-                        claude_replicas=self.CLAUDE_REPLICAS,
-                    )
+            budget_remaining = max(
+                0.0, self.BUDGET_HARD_USD - self._game_cost_usd
+            )
+
+            (
+                winner_provider,
+                winner_model,
+                response,
+                usage,
+                winner_duration_s,
+                per_provider_durations,
+            ) = asyncio.run(
+                _call_planner_cascade(
+                    prompt,
+                    plan_length=self.PLAN_LENGTH,
+                    budget_remaining_usd=budget_remaining,
                 )
             )
+
             response_preview = response[:300]
             self._plan_queue = _parse_plan(response, self.PLAN_LENGTH)
             plan_size = len(self._plan_queue)
             parse_ok = plan_size > 0
             if not self._plan_queue:
                 self._plan_queue = [(GameAction.ACTION5, {})]
+
+            # Record cost ONLY for the winning provider (the others'
+            # subprocesses also paid, but we're cascading sequentially so
+            # only one provider was actually called).
+            if winner_provider:
+                last_call_cost_usd = cost_tracker.record_call(
+                    provider=winner_provider,
+                    model=winner_model,
+                    usage=usage,
+                    duration_s=winner_duration_s,
+                    game_id=self.game_id,
+                    action_counter=self.action_counter,
+                    parse_ok=parse_ok,
+                )
+                self._game_cost_usd += last_call_cost_usd
+
+            # Budget gates.
+            if (
+                not self._soft_warned
+                and self._game_cost_usd >= self.BUDGET_SOFT_USD
+            ):
+                self._soft_warned = True
+                budget_state = "soft_warning"
+                logger.warning(
+                    f"[BUDGET WARNING] game={self.game_id} "
+                    f"cost=${self._game_cost_usd:.4f} "
+                    f"of hard ${self.BUDGET_HARD_USD:.2f}"
+                )
+            if self._game_cost_usd >= self.BUDGET_HARD_USD:
+                self._budget_exceeded = True
+                budget_state = "hard_stop"
+                logger.warning(
+                    f"[BUDGET HARD STOP] game={self.game_id} "
+                    f"cost=${self._game_cost_usd:.4f} -- ending game early"
+                )
 
         action, data = self._plan_queue.pop(0)
         if data:
@@ -490,15 +604,19 @@ class NhArcBaselineV0(Agent):
 
         self._log_decision(
             planner_invoked=planner_invoked,
-            race_winner_provider=winner_provider,
-            race_winner_latency_seconds=winner_latency,
-            race_competitor_latencies=competitor_latencies,
+            cascade_winner_provider=winner_provider,
+            cascade_winner_model=winner_model,
+            cascade_winner_duration_s=winner_duration_s,
+            cascade_per_provider_durations=per_provider_durations,
             plan_size=plan_size,
             parse_ok=parse_ok,
             action_name=action.name,
             queue_depth_after=len(self._plan_queue),
             planner_call_count=self._planner_call_count,
             response_preview=response_preview,
+            last_call_cost_usd=last_call_cost_usd,
+            total_game_cost_usd=self._game_cost_usd,
+            budget_state=budget_state,
         )
         return action
 
@@ -594,36 +712,60 @@ class NhArcBaselineV0(Agent):
             We will execute these in order and replan after the last one
             (or sooner if something looks off). It is fine to plan fewer
             than {self.PLAN_LENGTH} actions when the situation is unclear.
+
+            # HARD RULES (violating these = wasted turn)
+            1. **NEVER plan the same action {self.PLAN_LENGTH} times in a row.**
+               If you are tempted to write `ACTION1`x6, you have not read
+               the grid. Look again at the player position and walls.
+            2. **If `levels_completed` has not increased in the last 20
+               actions and recent moves were mostly identical, your
+               current direction is wrong.** Pick a DIFFERENT primary
+               action this turn and explore.
+            3. **If the latest grid is byte-identical to the previous
+               frame, your last action did nothing (you bumped a wall).**
+               Try a perpendicular direction.
+            4. Plan should reflect inspection of the grid -- describe in
+               your head where the player is, where walls are, what the
+               objective looks like, THEN write the {self.PLAN_LENGTH}
+               actions. Do not output the inspection; just use it.
             """
         ).strip()
 
     def _log_decision(
         self,
         planner_invoked: bool,
-        race_winner_provider: str,
-        race_winner_latency_seconds: float,
-        race_competitor_latencies: dict[str, float],
+        cascade_winner_provider: str,
+        cascade_winner_model: str,
+        cascade_winner_duration_s: float,
+        cascade_per_provider_durations: dict[str, float],
         plan_size: int,
         parse_ok: bool,
         action_name: str,
         queue_depth_after: int,
         planner_call_count: int,
         response_preview: str,
+        last_call_cost_usd: float,
+        total_game_cost_usd: float,
+        budget_state: str,
     ) -> None:
         record = {
             "ts": time.time(),
             "game_id": self.game_id,
             "action_counter": self.action_counter,
             "planner_invoked": planner_invoked,
-            "race_winner_provider": race_winner_provider,
-            "race_winner_latency_seconds": race_winner_latency_seconds,
-            "race_competitor_latencies": race_competitor_latencies,
+            "cascade_winner_provider": cascade_winner_provider,
+            "cascade_winner_model": cascade_winner_model,
+            "cascade_winner_duration_s": round(cascade_winner_duration_s, 3),
+            "cascade_per_provider_durations": cascade_per_provider_durations,
             "plan_size": plan_size,
             "parse_ok": parse_ok,
             "action_chosen": action_name,
             "queue_depth_after": queue_depth_after,
             "planner_call_count": planner_call_count,
             "game_card_used": bool(_card_for_game(self.game_id)),
+            "last_call_cost_usd": round(last_call_cost_usd, 6),
+            "total_game_cost_usd": round(total_game_cost_usd, 6),
+            "budget_state": budget_state,
             "response_preview": response_preview if planner_invoked else "",
         }
         try:
