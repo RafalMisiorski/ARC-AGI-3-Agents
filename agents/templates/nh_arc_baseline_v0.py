@@ -78,6 +78,7 @@ from arcengine import FrameData, GameAction, GameState
 from ..agent import Agent
 from . import cost_tracker
 from . import arc_vision
+from . import arc_game_state
 
 logger = logging.getLogger(__name__)
 
@@ -578,6 +579,13 @@ class NhArcBaselineV0(Agent):
         self._gemini_briefing: str = ""
         self._gemini_briefing_attempted: bool = False
 
+        # Phase B.1: persistent per-game state (LockSmithState for ls20,
+        # None for unknown game classes). Updated incrementally before
+        # each planner invocation. KNOWN LIMITATION: player_pos is not
+        # reliably tracked yet (see arc_game_state.py docstring).
+        self._game_state = arc_game_state.state_for_game(self.game_id)
+        self._prev_frame: list | None = None
+
     def is_done(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> bool:
@@ -618,6 +626,25 @@ class NhArcBaselineV0(Agent):
         budget_state = "ok"
 
         attempts: list[dict] = []
+        # Phase B.1: update persistent game state before any planner call.
+        # Runs every step (cheap, pure Python) so the state_diff in the
+        # next prompt reflects what just happened.
+        if self._game_state is not None:
+            last_action_name = (
+                self._action_history[-1].split()[0]
+                if self._action_history else ""
+            )
+            self._game_state = arc_game_state.update_locksmith_state(
+                prev=self._game_state,
+                frame=latest_frame.frame,
+                prev_action=last_action_name,
+                action_counter=self.action_counter,
+                level=latest_frame.levels_completed,
+                state_label=latest_frame.state.name,
+                prev_frame=self._prev_frame,
+            )
+        self._prev_frame = latest_frame.frame
+
         if not self._plan_queue:
             planner_invoked = True
             self._planner_call_count += 1
@@ -871,6 +898,18 @@ class NhArcBaselineV0(Agent):
             else ""
         )
 
+        # Phase B.1: persistent state block (LockSmith etc.). Provides a
+        # compact symbolic snapshot the planner can reason over without
+        # re-parsing the grid every turn. Disclaimer: player_pos
+        # tracking is best-effort -- see arc_game_state.py docstring.
+        state_block = ""
+        if self._game_state is not None:
+            state_block = (
+                "# PERSISTENT GAME STATE (tracked between turns)\n"
+                + self._game_state.to_prompt_block()
+                + "\n"
+            )
+
         # Phase A.2: Gemini visual briefing block (only when no color_map).
         gemini_block = ""
         if self._gemini_briefing and not used_symbolic:
@@ -908,6 +947,7 @@ class NhArcBaselineV0(Agent):
 
             {card_block}
             {gemini_block}
+            {state_block}
             {symbolic_guide}
             # AVAILABLE ACTIONS
             {avail}
