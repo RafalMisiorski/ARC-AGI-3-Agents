@@ -571,6 +571,13 @@ class NhArcBaselineV0(Agent):
         self._soft_warned: bool = False
         self._budget_exceeded: bool = False
 
+        # Phase A.2: Gemini multimodal briefing cache. Populated lazily
+        # on the first choose_action call when this game has no
+        # calibrated color_map. ONE Gemini call per game (~30-60s);
+        # subsequent prompts reuse the cached text.
+        self._gemini_briefing: str = ""
+        self._gemini_briefing_attempted: bool = False
+
     def is_done(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> bool:
@@ -614,6 +621,9 @@ class NhArcBaselineV0(Agent):
         if not self._plan_queue:
             planner_invoked = True
             self._planner_call_count += 1
+            # Phase A.2: one-time Gemini briefing for envs without
+            # symbolic color_map. No-op on subsequent calls.
+            self._ensure_gemini_briefing(latest_frame)
             prompt = self._build_planning_prompt(frames, latest_frame)
             budget_remaining = max(
                 0.0, self.BUDGET_HARD_USD - self._game_cost_usd
@@ -776,6 +786,38 @@ class NhArcBaselineV0(Agent):
             logger.warning(f"symbolic summary failed, falling back to hex: {e}")
             return _pretty_print_grid(frame), False
 
+    def _ensure_gemini_briefing(self, latest_frame: FrameData) -> None:
+        """Phase A.2: one-time Gemini multimodal briefing for unknown envs.
+
+        Triggered only when:
+          * we have no calibrated color_map for this game_id (so symbolic
+            extraction is unreliable), AND
+          * we haven't tried yet this session.
+
+        On success, caches a 6-10 line Gemini description in
+        ``self._gemini_briefing`` which the prompt builder appends as
+        a "# VISUAL BRIEFING" section.
+        """
+        if self._gemini_briefing_attempted:
+            return
+        if arc_vision.color_map_for_game(self.game_id):
+            # We have symbolic extraction; no need for Gemini fallback.
+            self._gemini_briefing_attempted = True
+            return
+        self._gemini_briefing_attempted = True
+        try:
+            png_path = Path(self.LOG_DIR) / f"briefing_{self.game_id}.png"
+            arc_vision.render_frame_to_png(latest_frame.frame, png_path)
+            logger.warning(f"[A.2] requesting Gemini briefing for {self.game_id}...")
+            text = arc_vision.describe_with_gemini(png_path, timeout=90)
+            self._gemini_briefing = text
+            if text:
+                logger.warning(
+                    f"[A.2] Gemini briefing cached ({len(text)} chars)"
+                )
+        except Exception as e:
+            logger.warning(f"[A.2] Gemini briefing failed: {e}")
+
     def _build_planning_prompt(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> str:
@@ -829,6 +871,14 @@ class NhArcBaselineV0(Agent):
             else ""
         )
 
+        # Phase A.2: Gemini visual briefing block (only when no color_map).
+        gemini_block = ""
+        if self._gemini_briefing and not used_symbolic:
+            gemini_block = (
+                f"# VISUAL BRIEFING (Gemini multimodal, one-time per game)\n"
+                f"{self._gemini_briefing}\n"
+            )
+
         # Symbolic perception guide (only when we use to_symbolic_summary).
         symbolic_guide = ""
         if used_symbolic:
@@ -857,6 +907,7 @@ class NhArcBaselineV0(Agent):
             GAME_OVER.
 
             {card_block}
+            {gemini_block}
             {symbolic_guide}
             # AVAILABLE ACTIONS
             {avail}

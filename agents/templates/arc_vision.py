@@ -302,3 +302,73 @@ def to_symbolic_summary(
             {"at": o["centroid"], "size": o["area"]} for o in sorted_insts
         ]
     return summary
+
+
+def describe_with_gemini(
+    png_path: Path,
+    prompt: str | None = None,
+    timeout: int = 90,
+) -> str:
+    """Send a frame PNG to Gemini CLI for multimodal description.
+
+    Used as a fallback for game classes without a calibrated color_map
+    (e.g. ar25, cn04). Free via Gemini CLI subscription.
+
+    Returns empty string on failure (caller falls back to hex). Latency
+    is ~30-60s per call -- callers should cache aggressively. Typical
+    usage: ONE call per game (initial briefing), not per action.
+    """
+    import os as _os
+    import shutil as _shutil
+    import subprocess as _subprocess
+
+    cmd_path = _shutil.which("gemini") or _shutil.which("gemini.cmd")
+    if not cmd_path:
+        return ""
+    if not png_path.is_file():
+        return ""
+
+    if prompt is None:
+        prompt = (
+            "Look at the image and describe the game state in 6-10 short lines. "
+            "Focus on: (1) player position (likely a small distinct sprite); "
+            "(2) walls or obstacles; (3) any goal/door/exit; (4) special "
+            "objects (rotators, items, indicators); (5) overall layout. "
+            "Use approximate [row, col] grid coordinates where useful "
+            "(grid is 64x64, row 0 = top, col 0 = left)."
+        )
+
+    # Gemini CLI references files in prompts via @path syntax. The path
+    # MUST be absolute -- a relative path would be resolved against
+    # gemini's cwd, which differs from ours.
+    abs_path = png_path.resolve().as_posix()
+    full_prompt = f"{prompt}\n\nImage: @{abs_path}"
+
+    env = _os.environ.copy()
+    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        env.pop(k, None)
+
+    try:
+        proc = _subprocess.run(
+            [cmd_path, "-p", full_prompt, "-m", "gemini-2.5-flash"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+    except _subprocess.TimeoutExpired:
+        return ""
+    except Exception:
+        return ""
+
+    text = (proc.stdout or "").strip()
+    # Strip CLI noise lines.
+    lines = [
+        line for line in text.split("\n")
+        if line.strip()
+        and not line.startswith("Loaded cached credentials")
+        and not line.startswith("Data collection")
+    ]
+    return "\n".join(lines).strip()
