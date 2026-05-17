@@ -1,21 +1,21 @@
 """arc_game_state.py -- per-game-class symbolic state tracking.
 
-KNOWN LIMITATION (Phase B.1 MVP, fix in Phase B.2):
-* player_pos tracking via connected-components is unreliable. On ls20
-  the yellow color (0x04) has many regions: arena background, UI panels,
-  AND the player sprite. Heuristics ("smallest region in size range",
-  "closest to previous position") all pick a static UI region instead
-  of the moving sprite. Validation on operator's 621-action replay shows
-  player_pos constant for the first 100 frames despite real motion.
-* Phase B.2 fix: identify player via FRAME-DIFF -- the region that
-  CHANGED between consecutive frames is the player. Requires keeping
-  prev_frame and computing cell-level diffs.
+Phase B.2 (current): player_pos tracked via FRAME-DIFF. The region that
+CHANGES between consecutive frames IS the player. Validation on
+operator's 621-action replay: player moves coherently step-to-step,
+e.g. (38, 30) -> (38, 31) -> (39, 31) after right+down moves.
 
-What DOES work in B.1:
-* Level transition detection (step 28 correctly registers 0 -> 1)
-* Door / rotator / key_indicator centroids
-* state_diff() compact representation
-* Dataclass serialization for prompt injection
+Phase B.1 MVP attempted single-frame heuristics ("smallest region in
+size range", "closest to previous position"). Both failed because
+ls20's yellow (0x04) appears in many static regions (arena background,
+UI panels) AND the moving sprite -- picking from frame alone we
+inevitably grabbed a static UI region.
+
+What works:
+* Level transition detection (step 28 registers 0 -> 1)
+* Door / rotator / key_indicator centroids (static, single-frame OK)
+* Frame-diff player tracking (Phase B.2)
+* Wall discovery via blocked-move detection
 
 
 Phase B.1 of the long-term plan. Replaces "LLM rediscovers everything
@@ -43,8 +43,69 @@ from dataclasses import dataclass, field, asdict
 from typing import Any
 
 import numpy as np
+from skimage import measure
 
 from . import arc_vision
+
+
+def _find_player_via_diff(
+    prev_frame: list[list[list[Any]]] | None,
+    curr_frame: list[list[list[Any]]],
+    prev_player_pos: tuple[float, float] | None,
+) -> tuple[tuple[float, float] | None, int]:
+    """Identify the player as the region of cells that changed between
+    consecutive frames.
+
+    Phase B.2: connected-component analysis over the diff mask.
+    * Player typically occupies ~12-30 changed cells per move (4x4 sprite
+      partially overlapping with old position).
+    * We prefer regions in [4, 60] cells (filters out 1-cell noise and
+      huge UI repaints) and, when prev_player_pos is known, pick the
+      closest such region.
+
+    Returns (None, 0) when there's no prev_frame (first observation)
+    or no motion -- caller falls back to prev_player_pos.
+    """
+    if prev_frame is None or not curr_frame:
+        return None, 0
+    try:
+        f0 = np.array(prev_frame[0])
+        f1 = np.array(curr_frame[0])
+    except Exception:
+        return None, 0
+    if f0.shape != f1.shape:
+        return None, 0
+
+    diff = f0 != f1
+    if not diff.any():
+        return None, 0  # no motion this step
+
+    labels = measure.label(diff, connectivity=2)
+    regions = measure.regionprops(labels)
+    if not regions:
+        return None, 0
+
+    # Filter to plausible sprite sizes.
+    candidates = [r for r in regions if 4 <= r.area <= 60]
+    if not candidates:
+        # No "sprite-sized" change; might be a level transition with
+        # many cells repainted. Pick the smallest changed region as a
+        # rough proxy (rarely correct, but bounded).
+        candidates = sorted(regions, key=lambda r: r.area)[:3]
+
+    if prev_player_pos is not None:
+        def _dist(r: Any) -> float:
+            return (r.centroid[0] - prev_player_pos[0]) ** 2 + (
+                r.centroid[1] - prev_player_pos[1]
+            ) ** 2
+        best = min(candidates, key=_dist)
+    else:
+        # First observed motion -- pick the largest plausible region
+        # (player sprite usually dominates the diff on first move).
+        best = max(candidates, key=lambda r: r.area)
+
+    return (round(float(best.centroid[0]), 1),
+            round(float(best.centroid[1]), 1)), int(best.area)
 
 
 @dataclass
@@ -156,21 +217,28 @@ def update_locksmith_state(
         min_size=2,
     )
 
-    # Player sprite tracking strategy:
-    #   1. Look for a play_area_bg region of plausible sprite size (4x4 = 16
-    #      cells, ~ 8-100 to be permissive about partial overlaps/transparency).
-    #   2. If we have a previous player_pos, pick the candidate CLOSEST to
-    #      it -- a movement of 1 cell shouldn't jump 30 rows away.
-    #   3. Otherwise pick the smallest qualifying region.
-    # NOTE: player_eyes (color 0x00) turned out to be a static UI feature
-    # on ls20, not the player; we no longer use it as primary signal.
-    player_pos, player_size = _extract_centroid(
-        objs,
-        "play_area_bg",
-        prefer_smaller=True,
-        near=prev.player_pos,
-        size_range=(8, 120),
+    # Phase B.2 player tracking: frame-diff detection.
+    # The region of cells that CHANGED between prev_frame and frame IS
+    # the player (it's the only thing moving in a single action step).
+    # When no motion (frame-equal => blocked) or first observation
+    # (no prev_frame), retain prev.player_pos as the best guess.
+    diff_pos, diff_size = _find_player_via_diff(
+        prev_frame, frame, prev.player_pos
     )
+    if diff_pos is not None:
+        player_pos, player_size = diff_pos, diff_size
+    else:
+        # No motion / no prior frame -- keep last known position.
+        # For the very first frame (prev.player_pos is None too), fall
+        # back to picking the smallest play_area_bg region as a rough
+        # initial guess (will lock in once the player actually moves).
+        if prev.player_pos is not None:
+            player_pos, player_size = prev.player_pos, 0
+        else:
+            player_pos, player_size = _extract_centroid(
+                objs, "play_area_bg", prefer_smaller=True,
+                size_range=(8, 60),
+            )
 
     door_pos, door_size = _extract_centroid(objs, "door_border")
     key_pos, key_size = _extract_centroid(objs, "key_indicator")
