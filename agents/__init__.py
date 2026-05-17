@@ -15,6 +15,7 @@ from .templates.llm_agents import LLM, FastLLM, GuidedLLM, ReasoningLLM
 from .templates.multimodal import MultiModalLLM
 from .templates.nh_arc_baseline_v0 import NhArcBaselineV0  # operator addition
 from .templates.nh_arc_official_v0 import NhArcOfficialV0  # operator addition
+from .templates.nh_arc_hierarchical_v0 import NhArcHierarchicalV0  # operator addition
 from .templates.random_agent import Random
 from .templates.reasoning_agent import ReasoningAgent
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
