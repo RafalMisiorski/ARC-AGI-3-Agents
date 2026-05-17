@@ -39,6 +39,7 @@ LOG_PATH = LOG_DIR / "cost_burn.jsonl"
 # every provider exposes cache token counts and the safest move for v0 is
 # to bill them as regular input.
 PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
+    "opus":             (15.00, 75.00),  # Anthropic claude-opus API rate (5x sonnet)
     "sonnet":           (3.00, 15.00),   # Anthropic claude-sonnet API rate
     "haiku":            (1.00,  5.00),   # Anthropic claude-haiku API rate
     "codex_default":    (1.10,  4.40),   # OpenAI o4-mini rate (Codex CLI default)
@@ -46,6 +47,13 @@ PRICING_USD_PER_1M: dict[str, tuple[float, float]] = {
 }
 
 EUR_PER_USD = 0.88  # rough mid-May 2026 rate
+
+# Rough conversion from USD to "% all-models weekly bucket on Max 20x".
+# Derived from Day 1 empirics (170 EUR / 193 USD burned -> 75% Sonnet weekly
+# + 62% all-models). The all-models bucket is bigger than Sonnet-only.
+# This is a ±50% estimate -- ALWAYS cross-check with claude.ai/settings/usage
+# rather than relying on this for hard quota decisions.
+USD_PER_PERCENT_ALL_MODELS_WEEKLY: float = 2.0
 
 
 def pricing_for(provider: str, model: str | None = None) -> tuple[float, float]:
@@ -80,8 +88,17 @@ def record_call(
     action_counter: int,
     parse_ok: bool,
     purpose: str = "arc_planner",
+    status: str = "winner",
 ) -> float:
     """Append one cost-tracking record. Returns estimated USD.
+
+    Args:
+        status: "winner" | "empty" | "timeout" | "error" | "skipped"
+            -- winner: this provider produced the plan we used.
+            -- empty: returned text but unparseable (no actions found).
+            -- timeout: subprocess killed at timeout (often = rate limit).
+            -- error: subprocess errored / wasn't on PATH.
+            -- skipped: cascade skipped this tier (e.g. budget too low).
 
     Safe to call from hook hot paths -- fails open on IO errors (logs are
     advisory; the agent continues regardless).
@@ -103,6 +120,7 @@ def record_call(
         "game_id": game_id,
         "action_counter": action_counter,
         "parse_ok": parse_ok,
+        "status": status,
     }
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -180,3 +198,85 @@ def sweep_cost_summary(game_ids: list[str]) -> dict[str, Any]:
 
 def get_log_path() -> Path:
     return LOG_PATH
+
+
+_NH_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+_NH_CACHE_TTL: float = 180.0  # 3 min -- NH endpoint takes ~6s, don't spam
+
+
+def fetch_nh_usage(
+    timeout: float = 10.0, force_refresh: bool = False
+) -> dict[str, Any] | None:
+    """Pull real Anthropic subscription %s from NH at localhost:8100.
+
+    Returns None if NH isn't running or the call fails. Result cached
+    for ``_NH_CACHE_TTL`` seconds because the endpoint takes ~6s per call
+    and we invoke this from every planner-call hot path.
+
+    NH counts raw output tokens against subscription rate-limit caps; the
+    numbers are NOT identical to claude.ai/settings/usage (which weights
+    by model price / compute / cache discount). NH's % is a CONSERVATIVE
+    proxy -- typically reads 100% even when claude.ai shows 30-60%.
+    Useful for visibility, NOT for hard-stop decisions.
+    """
+    now = time.time()
+    if not force_refresh and (now - _NH_CACHE["ts"]) < _NH_CACHE_TTL:
+        return _NH_CACHE["data"]
+
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "http://localhost:8100/api/usage/limits",
+            headers={"X-API-Key": "dev"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        result = {
+            "session_percent": float(
+                data.get("session", {}).get("percent_used", 0.0)
+            ),
+            "weekly_all_percent": float(
+                data.get("weekly_all_models", {}).get("percent_used", 0.0)
+            ),
+            "weekly_sonnet_percent": float(
+                data.get("weekly_sonnet", {}).get("percent_used", 0.0)
+            ),
+            "source": "nh_localhost_8100",
+        }
+    except Exception:
+        result = None
+
+    _NH_CACHE["ts"] = now
+    _NH_CACHE["data"] = result
+    return result
+
+
+def today_total_usd(date_str: str | None = None) -> dict[str, Any]:
+    """Sum cost across all records whose ts starts with ``date_str`` (YYYY-MM-DD).
+
+    Defaults to today's UTC date.
+    """
+    if date_str is None:
+        date_str = time.strftime("%Y-%m-%d", time.gmtime())
+    total = 0.0
+    by_provider: dict[str, float] = {}
+    calls = 0
+    for rec in _iter_records():
+        ts = rec.get("ts", "")
+        if not ts.startswith(date_str):
+            continue
+        calls += 1
+        cost = float(rec.get("estimated_overage_usd") or 0.0)
+        total += cost
+        prov = str(rec.get("backend") or "").replace("_cli", "") or "unknown"
+        by_provider[prov] = by_provider.get(prov, 0.0) + cost
+    return {
+        "date": date_str,
+        "total_usd": round(total, 4),
+        "total_eur": round(total * EUR_PER_USD, 4),
+        "estimated_percent_all_models_weekly": round(
+            total / USD_PER_PERCENT_ALL_MODELS_WEEKLY, 2
+        ),
+        "calls": calls,
+        "by_provider": {k: round(v, 4) for k, v in by_provider.items()},
+    }

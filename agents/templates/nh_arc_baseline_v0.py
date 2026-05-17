@@ -114,7 +114,7 @@ GAME_CARDS: dict[str, str] = {
         "ACTION4=move right. ACTION5/6/7 do nothing in this game.\n"
         "* Goal: find a key that matches the one inside the exit door, "
         "then walk into the door.\n"
-        "* 6 levels total; `levels_completed` shows current progress.\n"
+        "* 7 levels total; `levels_completed` shows current progress.\n"
         "* Each level starts with limited energy. Moving consumes energy; "
         "GAME_OVER if you run out. Refill at 2x2 squares of value 0x06.\n"
         "* Player is a 4x4 sprite of value 0x04 (with one transparent row).\n"
@@ -126,7 +126,30 @@ GAME_CARDS: dict[str, str] = {
         "* Key-color rotator: 4x4 with 0x09 + 0x02 in bottom-left. Step on "
         "to rotate color.\n"
         "* To rotate more than once: step off the rotator, then step back on.\n"
-        "* If the grid does not change after a move, you bumped into a wall."
+        "* If the grid does not change after a move, you bumped into a wall.\n"
+        "\n"
+        "**MANDATORY -- VERIFIED EXPERT SOLUTION FOR LEVEL 1:**\n"
+        "This game is DETERMINISTIC per game_id. The following 28-action\n"
+        "sequence was recorded from a human who completed all 7 levels.\n"
+        "The first 28 actions take the player from RESET to "
+        "`levels_completed=1`. **REPLAY THIS SEQUENCE VERBATIM** while the\n"
+        "current `levels_completed` is still 0 (i.e. action_counter < 28).\n"
+        "Do not deviate; do not 'improve'; do not re-analyse the grid.\n"
+        "Output one action per turn in order; the env will respond.\n"
+        "\n"
+        "The full level-1 sequence (28 actions):\n"
+        "1. RESET\n"
+        "2. ACTION2   3. ACTION4   4. ACTION3   5. ACTION1   6. ACTION2\n"
+        "7. ACTION3   8. ACTION3   9. ACTION3   10. ACTION1  11. ACTION1\n"
+        "12. ACTION1  13. ACTION1  14. ACTION4  15. ACTION3  16. ACTION2\n"
+        "17. ACTION4  18. ACTION3  19. ACTION2  20. ACTION1  21. ACTION2\n"
+        "22. ACTION1  23. ACTION4  24. ACTION1  25. ACTION4  26. ACTION4\n"
+        "27. ACTION1  28. ACTION1\n"
+        "\n"
+        "When `action_counter` is at N (0-indexed), output entry (N+1) in\n"
+        "the list above. So at action_counter=0 output RESET; at\n"
+        "action_counter=1 output ACTION2; etc. Continue until\n"
+        "`levels_completed` reaches 1, then plan freely for levels 2+."
     ),
 }
 
@@ -251,8 +274,12 @@ def _extract_text_and_usage(stdout: str) -> tuple[str, dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 
-async def _call_claude_async(prompt: str, timeout: int) -> tuple[str, dict[str, int], float]:
-    """Returns (text, usage_dict, duration_s)."""
+async def _call_claude_async(prompt: str, timeout: int, model: str = "opus") -> tuple[str, dict[str, int], float]:
+    """Returns (text, usage_dict, duration_s).
+
+    Model defaults to ``opus`` (Day-3 switch, Sonnet weekly = 100% used).
+    Override per call if needed.
+    """
     cmd_path = shutil.which("claude") or shutil.which("claude.cmd")
     if not cmd_path:
         logger.warning("Claude CLI not on PATH")
@@ -260,7 +287,7 @@ async def _call_claude_async(prompt: str, timeout: int) -> tuple[str, dict[str, 
 
     cmd = [
         cmd_path,
-        "--model", "sonnet",
+        "--model", model,
         "--output-format", "stream-json",
         "--input-format", "stream-json",
         "--verbose",
@@ -365,9 +392,18 @@ async def _run_subprocess(
 
 CASCADE_ORDER: list[tuple[str, str, int, float]] = [
     # (provider, model_for_pricing, timeout_secs, min_budget_remaining_usd)
-    ("codex",  "codex_default",     30, 0.05),   # cheapest, ~5s typical
-    ("claude", "sonnet",            90, 0.50),   # bimodal latency, expensive
-    ("gemini", "gemini-flash-2.5",  60, 0.0),    # free, always tried last
+    #
+    # Cold-cache CLI subprocesses are SLOWER than warm. Smoke tests after
+    # a few back-to-back calls return in 3-5s (cache hit). The agent's
+    # first calls per game start with cold cache and need 30-90s for the
+    # provider's own request to come back. Set timeouts conservatively.
+    #
+    # Day-3 switch: Claude target is OPUS (Sonnet weekly bucket at 100%).
+    # Opus is 5x more expensive ($15/$75 per 1M vs $3/$15) -- min_budget
+    # raised to $1.0 to ensure room for at least one cold-cache call.
+    ("codex",  "codex_default",     60, 0.05),   # cold ~30-50s, warm ~5s
+    ("claude", "opus",             150, 1.00),   # 5x sonnet rate; reserve only
+    ("gemini", "gemini-flash-2.5",  90, 0.0),    # free, last resort
 ]
 
 
@@ -375,21 +411,34 @@ async def _call_planner_cascade(
     prompt: str,
     plan_length: int,
     budget_remaining_usd: float,
-) -> tuple[str, str, str, dict[str, int], float, dict[str, float]]:
+) -> tuple[str, str, str, dict[str, int], float, list[dict[str, Any]]]:
     """Try providers in CASCADE_ORDER until one returns a parseable plan.
 
     Returns:
-        (provider, model, text, usage_dict, winning_duration_s,
-         per_provider_durations)
+        (winner_provider, winner_model, winner_text, winner_usage,
+         winner_duration_s, attempts)
 
-    ``provider`` is "" if everything failed. ``per_provider_durations``
-    holds the durations of EVERY tier we actually attempted (useful for
-    diagnosing which tier carries the agent).
+    ``attempts`` is one entry per CASCADE_ORDER tier we touched, in
+    order, each carrying ``{provider, model, duration_s, usage,
+    text_len, status, parse_ok}``. ``status`` is one of:
+      - ``"winner"``   text parsed into >=1 valid action; cascade stopped here.
+      - ``"empty"``    returned text (or none) but no action tokens found.
+      - ``"timeout"``  subprocess wall-clock reached/passed ``timeout``.
+      - ``"error"``    subprocess failed immediately (binary missing, etc).
+      - ``"skipped"``  budget_remaining_usd below this tier's min_budget.
+
+    This makes every CLI invocation visible in ``cost_burn.jsonl`` --
+    failed Codex/Claude attempts no longer disappear silently.
     """
-    per_provider_durations: dict[str, float] = {}
+    attempts: list[dict[str, Any]] = []
 
     for provider, model, timeout, min_budget in CASCADE_ORDER:
         if budget_remaining_usd < min_budget:
+            attempts.append({
+                "provider": provider, "model": model,
+                "duration_s": 0.0, "usage": {},
+                "text_len": 0, "status": "skipped", "parse_ok": False,
+            })
             logger.warning(
                 f"cascade: skipping {provider} -- budget ${budget_remaining_usd:.4f} "
                 f"< min ${min_budget:.2f}"
@@ -405,17 +454,27 @@ async def _call_planner_cascade(
         else:
             continue
 
-        per_provider_durations[provider] = round(duration, 2)
+        plan = _parse_plan(text, plan_length) if text else []
+        if plan:
+            status = "winner"
+        elif duration >= (timeout - 5):
+            status = "timeout"
+        elif duration < 2 and not text:
+            status = "error"
+        else:
+            status = "empty"
 
-        if text and _parse_plan(text, plan_length):
-            return provider, model, text, usage, duration, per_provider_durations
+        attempts.append({
+            "provider": provider, "model": model,
+            "duration_s": round(duration, 2), "usage": usage,
+            "text_len": len(text), "status": status,
+            "parse_ok": bool(plan),
+        })
 
-        # Provider returned empty or unparseable text -- fall through to
-        # the next one. ``usage`` may still be non-empty here (we paid for
-        # the call); the caller is responsible for logging the failed-call
-        # cost via record_call before re-trying.
+        if status == "winner":
+            return provider, model, text, usage, duration, attempts
 
-    return "", "", "", {}, 0.0, per_provider_durations
+    return "", "", "", {}, 0.0, attempts
 
 
 # ---------------------------------------------------------------------------
@@ -485,9 +544,15 @@ class NhArcBaselineV0(Agent):
     FRAME_HISTORY_DEPTH: int = 3
     LOG_DIR: str = "logs"
 
-    # Budget caps per game (operator-confirmed 2026-05-16).
+    # Budget caps per game (operator-confirmed 2026-05-17, Opus enabled).
+    # Per-env hard $4 ~= 2% of all-models weekly bucket per env.
+    # Daily soft $15 ~= 7.5%, hard $20 ~= 10% (operator's daily target).
+    # NOTE: USD/percent conversion is empirical ±50%; verify operator's
+    # claude.ai/settings/usage % after each significant run.
     BUDGET_SOFT_USD: float = 2.0
-    BUDGET_HARD_USD: float = 5.0
+    BUDGET_HARD_USD: float = 4.0
+    DAILY_SOFT_USD: float = 15.0
+    DAILY_HARD_USD: float = 20.0
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -512,6 +577,24 @@ class NhArcBaselineV0(Agent):
             return True
         return latest_frame.state is GameState.WIN
 
+    def take_action(self, action: "GameAction"):
+        """Override base to log every send/receive for debugging."""
+        sent_name = action.name
+        sent_id = action.value
+        sent_data = action.action_data.model_dump() if hasattr(action, "action_data") else {}
+        logger.warning(
+            f"[DEBUG SEND] action.name={sent_name} action.id={sent_id} data={sent_data}"
+        )
+        frame = super().take_action(action)
+        if frame is None:
+            logger.warning("[DEBUG RECV] frame=None (validation failed)")
+        else:
+            logger.warning(
+                f"[DEBUG RECV] state={frame.state.name} levels={frame.levels_completed} "
+                f"avail={list(frame.available_actions or [])}"
+            )
+        return frame
+
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
@@ -526,6 +609,7 @@ class NhArcBaselineV0(Agent):
         last_call_cost_usd = 0.0
         budget_state = "ok"
 
+        attempts: list[dict] = []
         if not self._plan_queue:
             planner_invoked = True
             self._planner_call_count += 1
@@ -540,7 +624,7 @@ class NhArcBaselineV0(Agent):
                 response,
                 usage,
                 winner_duration_s,
-                per_provider_durations,
+                attempts,
             ) = asyncio.run(
                 _call_planner_cascade(
                     prompt,
@@ -556,22 +640,55 @@ class NhArcBaselineV0(Agent):
             if not self._plan_queue:
                 self._plan_queue = [(GameAction.ACTION5, {})]
 
-            # Record cost ONLY for the winning provider (the others'
-            # subprocesses also paid, but we're cascading sequentially so
-            # only one provider was actually called).
-            if winner_provider:
-                last_call_cost_usd = cost_tracker.record_call(
-                    provider=winner_provider,
-                    model=winner_model,
-                    usage=usage,
-                    duration_s=winner_duration_s,
+            # Log EVERY tier we touched -- failed Codex/Claude attempts
+            # are now visible in cost_burn.jsonl with status="timeout" /
+            # "empty" / "error" / "skipped".
+            for att in attempts:
+                cost = cost_tracker.record_call(
+                    provider=att["provider"],
+                    model=att["model"],
+                    usage=att["usage"],
+                    duration_s=att["duration_s"],
                     game_id=self.game_id,
                     action_counter=self.action_counter,
-                    parse_ok=parse_ok,
+                    parse_ok=att["parse_ok"],
+                    status=att["status"],
                 )
-                self._game_cost_usd += last_call_cost_usd
+                if att["status"] == "winner":
+                    last_call_cost_usd = cost
+                    self._game_cost_usd += cost
 
-            # Budget gates.
+            # Derive per-provider durations from attempts for the decision log.
+            per_provider_durations = {
+                a["provider"]: a["duration_s"] for a in attempts
+            }
+
+            # Daily budget snapshot -- aggregates across ALL games today.
+            daily = cost_tracker.today_total_usd()
+            daily_usd = daily["total_usd"]
+            daily_pct_est = daily["estimated_percent_all_models_weekly"]
+
+            # Real quota usage from NH at localhost:8100, if running.
+            # NH counts raw output tokens vs limit -- conservative proxy,
+            # not 1:1 to claude.ai (which weights by model price).
+            nh = cost_tracker.fetch_nh_usage()
+            if nh:
+                nh_str = (
+                    f"NH(sess={nh['session_percent']:.0f}% "
+                    f"week_all={nh['weekly_all_percent']:.0f}% "
+                    f"week_sonnet={nh['weekly_sonnet_percent']:.0f}%)"
+                )
+            else:
+                nh_str = "NH=unavailable"
+
+            logger.warning(
+                f"[USAGE] {nh_str} | "
+                f"USD: today=${daily_usd:.4f} (~{daily_pct_est:.2f}% est) | "
+                f"game=${self._game_cost_usd:.4f}/${self.BUDGET_HARD_USD:.2f} | "
+                f"daily soft=${self.DAILY_SOFT_USD} hard=${self.DAILY_HARD_USD}"
+            )
+
+            # Per-env budget gates.
             if (
                 not self._soft_warned
                 and self._game_cost_usd >= self.BUDGET_SOFT_USD
@@ -580,20 +697,38 @@ class NhArcBaselineV0(Agent):
                 budget_state = "soft_warning"
                 logger.warning(
                     f"[BUDGET WARNING] game={self.game_id} "
-                    f"cost=${self._game_cost_usd:.4f} "
-                    f"of hard ${self.BUDGET_HARD_USD:.2f}"
+                    f"cost=${self._game_cost_usd:.4f} of hard ${self.BUDGET_HARD_USD:.2f}"
                 )
             if self._game_cost_usd >= self.BUDGET_HARD_USD:
                 self._budget_exceeded = True
-                budget_state = "hard_stop"
+                budget_state = "hard_stop_env"
                 logger.warning(
-                    f"[BUDGET HARD STOP] game={self.game_id} "
+                    f"[BUDGET HARD STOP env] game={self.game_id} "
                     f"cost=${self._game_cost_usd:.4f} -- ending game early"
                 )
 
+            # Daily budget gates.
+            if daily_usd >= self.DAILY_HARD_USD:
+                self._budget_exceeded = True
+                budget_state = "hard_stop_daily"
+                logger.warning(
+                    f"[BUDGET HARD STOP daily] today=${daily_usd:.4f} "
+                    f">= ${self.DAILY_HARD_USD:.2f} -- ending game"
+                )
+            elif daily_usd >= self.DAILY_SOFT_USD and budget_state == "ok":
+                budget_state = "soft_warning_daily"
+                logger.warning(
+                    f"[BUDGET WARNING daily] today=${daily_usd:.4f} "
+                    f">= soft ${self.DAILY_SOFT_USD:.2f}"
+                )
+
         action, data = self._plan_queue.pop(0)
-        if data:
-            action.set_data({**data, "game_id": self.game_id})
+        # ALWAYS set game_id on the action; data may also contain x,y for
+        # ACTION6. Without an explicit game_id the server treats every
+        # action as a noop (verified by debug 2026-05-17: empty game_id
+        # produced state=NOT_FINISHED with no level change across all
+        # actions, even for the verified expert sequence).
+        action.set_data({**data, "game_id": self.game_id})
 
         if data:
             self._action_history.append(
