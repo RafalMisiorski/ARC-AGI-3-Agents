@@ -77,6 +77,7 @@ from arcengine import FrameData, GameAction, GameState
 
 from ..agent import Agent
 from . import cost_tracker
+from . import arc_vision
 
 logger = logging.getLogger(__name__)
 
@@ -755,23 +756,45 @@ class NhArcBaselineV0(Agent):
         )
         return action
 
+    def _describe_frame(self, frame: list[list[list[Any]]]) -> tuple[str, bool]:
+        """Return (description_text, used_symbolic).
+
+        If we have a calibrated color map for this game, return a compact
+        symbolic facts JSON (~150-300 tokens vs ~3000 for hex spam).
+        Otherwise fall back to hex pretty-print so unknown game classes
+        still get usable input.
+        """
+        cmap = arc_vision.color_map_for_game(self.game_id)
+        if not cmap:
+            return _pretty_print_grid(frame), False
+        try:
+            summary = arc_vision.to_symbolic_summary(
+                frame, color_name_map=cmap, max_objects_per_type=5
+            )
+            return json.dumps(summary, indent=1), True
+        except Exception as e:
+            logger.warning(f"symbolic summary failed, falling back to hex: {e}")
+            return _pretty_print_grid(frame), False
+
     def _build_planning_prompt(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> str:
         history_depth = min(self.FRAME_HISTORY_DEPTH, max(len(frames) - 1, 0))
         history_blocks: list[str] = []
         for i, f in enumerate(frames[-history_depth - 1 : -1]):
+            past_desc, _ = self._describe_frame(f.frame)
             history_blocks.append(
                 f"--- past frame t-{history_depth - i} (state={f.state.name}, "
                 f"levels_completed={f.levels_completed}) ---\n"
-                + _pretty_print_grid(f.frame)
+                + past_desc
             )
 
+        latest_desc, used_symbolic = self._describe_frame(latest_frame.frame)
         latest_block = (
             f"--- current frame (state={latest_frame.state.name}, "
             f"levels_completed={latest_frame.levels_completed}, "
             f"action_counter={self.action_counter}) ---\n"
-            + _pretty_print_grid(latest_frame.frame)
+            + latest_desc
         )
 
         avail_names: list[str] = []
@@ -806,6 +829,24 @@ class NhArcBaselineV0(Agent):
             else ""
         )
 
+        # Symbolic perception guide (only when we use to_symbolic_summary).
+        symbolic_guide = ""
+        if used_symbolic:
+            symbolic_guide = (
+                "# HOW TO READ THE FRAME SECTIONS\n"
+                "The frame is given as a JSON of detected objects (NOT a hex\n"
+                "grid). Each named class is a list of regions with their\n"
+                "centroid `at: [row, col]` and `size` (cell count). Grid\n"
+                "coordinates: row 0 is top, col 0 is left, both [0..63].\n"
+                "Movement: ACTION1=up (row-), ACTION2=down (row+),\n"
+                "ACTION3=left (col-), ACTION4=right (col+).\n"
+                "Use centroid positions to plan paths: the difference\n"
+                "between player and target gives the rough action sequence.\n"
+                "If you don't see `player_eyes` in the current frame, look\n"
+                "for the smallest play_area_bg region -- that's the player\n"
+                "sprite footprint.\n"
+            )
+
         return textwrap.dedent(
             f"""\
             # ROLE
@@ -816,6 +857,7 @@ class NhArcBaselineV0(Agent):
             GAME_OVER.
 
             {card_block}
+            {symbolic_guide}
             # AVAILABLE ACTIONS
             {avail}
 
