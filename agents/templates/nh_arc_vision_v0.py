@@ -173,41 +173,16 @@ def _call_gemini_vision(png_path: Path, prompt: str, timeout: int = 90) -> tuple
         return "", time.time() - t0
 
 
-# Per-game-class hint cards (from baseline_v0 GAME_CARDS). When the env_id
-# prefix matches, this is injected into the vision planner prompt as a
-# "# GAME-SPECIFIC NOTES" section -- gives the LLM concrete mechanics it
-# would otherwise have to rediscover within the 80-action budget.
-GAME_CARDS: dict[str, str] = {
-    "ls20": (
-        "You are playing **LockSmith**. Rules and strategy:\n"
-        "* ACTION1=move up, ACTION2=move down, ACTION3=move left, "
-        "ACTION4=move right. ACTION5/6/7 do nothing in this game.\n"
-        "* Goal: find a key that matches the one inside the exit door, "
-        "then walk into the door.\n"
-        "* 6 levels total; `levels_completed` shows current progress.\n"
-        "* Each level starts with limited energy. Moving consumes energy; "
-        "GAME_OVER if you run out. Refill at 2x2 squares of energy pills.\n"
-        "* Walls block movement. If the grid does not change after a move, "
-        "you bumped into a wall -- pick a different direction.\n"
-        "* Look for key-shape rotators and color rotators in the corners. "
-        "Step on/off them to cycle key shape and color until they match "
-        "the target key shown in the exit door.\n"
-    ),
-}
-
-
-def _card_for_game(game_id: str) -> str:
-    if not game_id:
-        return ""
-    key = game_id.split("-", 1)[0]
-    return GAME_CARDS.get(key, "")
+# Reuse baseline_v0's full GAME_CARDS coverage (20 envs across 5 classes)
+# rather than duplicating a single-env dict here.
+from .nh_arc_baseline_v0 import GAME_CARDS, _card_for_game  # noqa: F401
 
 
 class NhArcVisionV0(Agent):
     """Per-action multimodal Claude vision agent."""
 
     MAX_ACTIONS: int = 80
-    PLAN_LENGTH: int = 6
+    PLAN_LENGTH: int = 12  # bumped from 6 to halve vision-call frequency (throttle relief)
     VISION_TIMEOUT_SECS: int = 60
     GEMINI_FALLBACK_TIMEOUT_SECS: int = 90
     BUDGET_HARD_USD: float = 5.0
