@@ -46,25 +46,19 @@ logger = logging.getLogger(__name__)
 
 
 # Hardcoded expert sequences per env_id prefix.
-# Source: GAME_CARDS in nh_arc_baseline_v0.py (operator's manual playthrough
-# capture). The MANDATORY VERIFIED EXPERT SOLUTION FOR LEVEL 1 was already
-# embedded in the LockSmith card.
+# Source: operator's manual REPL playthrough on 2026-05-20 via
+# nh_arc_manual_v0 (game_id ls20-9607627b, scorecard 96edc65e-...).
+# Reached levels_completed=1 at step 14 (15 actions total, vs human
+# baseline 22). The legacy 28-action sequence in GAME_CARDS was stale
+# for the current env hash and yielded 0 levels.
 EXPERT_SEQUENCES: dict[str, list[str]] = {
     "ls20": [
-        # 1
-        "RESET",
-        # 2-6
-        "ACTION2", "ACTION4", "ACTION3", "ACTION1", "ACTION2",
-        # 7-11
-        "ACTION3", "ACTION3", "ACTION3", "ACTION1", "ACTION1",
-        # 12-16
-        "ACTION1", "ACTION1", "ACTION4", "ACTION3", "ACTION2",
-        # 17-21
-        "ACTION4", "ACTION3", "ACTION2", "ACTION1", "ACTION2",
-        # 22-26
-        "ACTION1", "ACTION4", "ACTION1", "ACTION4", "ACTION4",
-        # 27-28
-        "ACTION1", "ACTION1",
+        # Steps 0-4
+        "ACTION1", "ACTION2", "ACTION3", "ACTION3", "ACTION3",
+        # Steps 5-9
+        "ACTION1", "ACTION1", "ACTION1", "ACTION1", "ACTION4",
+        # Steps 10-14 (level 1 achieved at the final ACTION1)
+        "ACTION4", "ACTION4", "ACTION1", "ACTION1", "ACTION1",
     ],
 }
 
