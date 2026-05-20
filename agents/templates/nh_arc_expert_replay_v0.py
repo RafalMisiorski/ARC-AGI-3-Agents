@@ -62,6 +62,37 @@ EXPERT_SEQUENCES: dict[str, list[str]] = {
     ],
 }
 
+# Where to look for agent-side action logs written by nh_arc_manual_v0.
+# Format: one JSON per line with {action_name, action_data, action_counter}.
+# Latest matching <prefix>_*.jsonl wins if no hardcoded entry exists.
+_ACTIONS_DIR = Path("logs/manual_actions")
+
+
+def _load_sequence_from_jsonl(game_id_prefix: str) -> list[tuple[str, dict]]:
+    """Find newest manual_actions/<prefix>_*.jsonl and parse action sequence."""
+    if not _ACTIONS_DIR.is_dir():
+        return []
+    candidates = sorted(
+        _ACTIONS_DIR.glob(f"{game_id_prefix}*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if not candidates:
+        return []
+    out: list[tuple[str, dict]] = []
+    for line in candidates[-1].read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            name = rec.get("action_name")
+            data = rec.get("action_data") or {}
+            if isinstance(name, str) and name:
+                out.append((name, dict(data)))
+        except json.JSONDecodeError:
+            continue
+    return out
+
 
 class NhArcExpertReplayV0(Agent):
     """Deterministic action-queue agent. Replays a hardcoded sequence."""
@@ -78,16 +109,31 @@ class NhArcExpertReplayV0(Agent):
         )
 
         key = self.game_id.split("-", 1)[0]
-        self._sequence: list[str] = list(EXPERT_SEQUENCES.get(key, []))
+        # Priority:
+        # 1. Hardcoded EXPERT_SEQUENCES (curated, fast)
+        # 2. Latest agent-side JSONL from manual_v0 playthrough (auto-loaded)
+        # 3. Empty -> agent idles
+        self._sequence: list[tuple[str, dict]] = []
+        self._source: str = "none"
+        if key in EXPERT_SEQUENCES:
+            self._sequence = [(n, {}) for n in EXPERT_SEQUENCES[key]]
+            self._source = "hardcoded"
+        else:
+            loaded = _load_sequence_from_jsonl(key)
+            if loaded:
+                self._sequence = loaded
+                self._source = "jsonl"
+
         if not self._sequence:
             logger.warning(
-                f"[EXPERT REPLAY] No hardcoded sequence for game_id prefix "
-                f"{key!r}. Agent will idle on ACTION5."
+                f"[EXPERT REPLAY] No sequence for game_id prefix {key!r} "
+                f"(checked hardcoded + {_ACTIONS_DIR}). Agent will idle "
+                f"on ACTION5."
             )
         else:
             logger.warning(
-                f"[EXPERT REPLAY] Loaded {len(self._sequence)} actions for "
-                f"prefix {key!r}. Will replay verbatim."
+                f"[EXPERT REPLAY] Loaded {len(self._sequence)} actions "
+                f"({self._source}) for prefix {key!r}. Replaying verbatim."
             )
 
         self._level_at_start: int = 0
@@ -107,8 +153,9 @@ class NhArcExpertReplayV0(Agent):
     def choose_action(
         self, frames: list[FrameData], latest_frame: FrameData
     ) -> GameAction:
+        data: dict = {}
         if self.action_counter < len(self._sequence):
-            name = self._sequence[self.action_counter]
+            name, data = self._sequence[self.action_counter]
         else:
             if self._sequence_exhausted_at is None:
                 self._sequence_exhausted_at = self.action_counter
@@ -125,6 +172,9 @@ class NhArcExpertReplayV0(Agent):
             logger.warning(f"[EXPERT REPLAY] Bad action name {name!r}, "
                            f"falling back to ACTION5")
             action = GameAction.ACTION5
+
+        if data:
+            action.set_data({**data, "game_id": self.game_id})
 
         self._log_step(
             action_name=action.name,

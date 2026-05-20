@@ -48,18 +48,31 @@ class NhArcManualV0(Agent):
 
     MAX_ACTIONS: int = 1000  # operator decides when to quit
     FRAMES_DIR: str = "logs/manual_frames"
+    ACTIONS_DIR: str = "logs/manual_actions"
     AUTO_OPEN_PNG: bool = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._frames_dir = Path(self.FRAMES_DIR) / self.game_id
         self._frames_dir.mkdir(parents=True, exist_ok=True)
+
+        # Agent-side action log -- bypasses framework recording bug where
+        # action_input.id is always echoed as 0 in the saved recording.jsonl.
+        # This file stores the REAL action that was sent (post-REPL parse),
+        # ready for ExpertReplayAgent or any deterministic replay.
+        import json as _json
+        Path(self.ACTIONS_DIR).mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        self._action_log_path = Path(self.ACTIONS_DIR) / f"{self.game_id}_{ts}.jsonl"
+
         self._quit = False
         self._last_opened_path: Path | None = None
+
         print("\n" + "=" * 70)
         print(f"MANUAL REPL  game={self.game_id}")
-        print(f"  Frames saved to: {self._frames_dir.resolve()}")
-        print(f"  Recording: framework auto-saves to recordings/")
+        print(f"  Frames saved to:    {self._frames_dir.resolve()}")
+        print(f"  Action log (clean): {self._action_log_path.resolve()}")
+        print(f"  Framework recording (buggy): recordings/")
         print(f"  Commands: ACTION1-7 [x=N y=N] | RESET | QUIT")
         print("=" * 70)
 
@@ -135,6 +148,27 @@ class NhArcManualV0(Agent):
 
             # Always set game_id (some env wrappers need it)
             action.set_data({**data, "game_id": self.game_id})
+
+            # Append to agent-side action log BEFORE returning so the
+            # operator's intent is captured even if the framework crashes
+            # mid-step.
+            import json as _json
+            try:
+                record = {
+                    "ts": time.time(),
+                    "game_id": self.game_id,
+                    "action_counter": self.action_counter,
+                    "action_name": action.name,
+                    "action_data": dict(data),
+                    "state_before": latest_frame.state.name,
+                    "levels_completed_before": latest_frame.levels_completed,
+                    "available_actions": list(latest_frame.available_actions or []),
+                }
+                with self._action_log_path.open("a", encoding="utf-8") as f:
+                    f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+            except OSError:
+                pass
+
             return action
 
     @staticmethod
