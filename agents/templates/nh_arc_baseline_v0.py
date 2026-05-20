@@ -109,7 +109,87 @@ _ACTION_PATTERN = re.compile(
 # Source: agents/templates/llm_agents.py::GuidedLLM (LockSmith rules) --
 # the upstream framework already encoded these for OpenAI o3 GuidedLLM. We
 # vendor them here for our race-based agent.
+_PURE_CLICK_CARD = (
+    "You are playing a **click-based puzzle** (PURE_CLICK class).\n"
+    "* ACTION6 with (x, y) coordinates is the primary action.\n"
+    "* Other actions (ACTION1-5, ACTION7) likely do nothing or have minor\n"
+    "  side effects.\n"
+    "* Strategy: identify clickable targets in the image (distinct sprites,\n"
+    "  buttons, objects, pairs to match). Click them in a sensible order.\n"
+    "* Coordinates: x in [0, 63] (column), y in [0, 63] (row).\n"
+    "* When picking targets, prefer clicking on the CENTER of a sprite, not\n"
+    "  its edge. If the grid does not change after a click, you missed --\n"
+    "  try slightly different (x, y) offset.\n"
+    "* Plan format: ACTION6 x=NN y=NN (one per line).\n"
+)
+
+_CLICK_OBJECT_CARD = (
+    "You are playing an **object-manipulation puzzle** (CLICK_OBJECT class).\n"
+    "* Primary action is ACTION6 (x, y) -- click to select / grab / place\n"
+    "  objects. Movement actions (ACTION1-4) may also be active for cursor\n"
+    "  positioning or scrolling.\n"
+    "* Strategy: identify movable objects vs. fixed obstacles in the image.\n"
+    "  Click to select, then click target location (or move with arrows).\n"
+    "  Look for matching pairs, goal slots, stacking targets, or color/shape\n"
+    "  alignment.\n"
+    "* Coordinates: x, y in [0, 63].\n"
+    "* If the grid is unchanged after action, your click missed or the move\n"
+    "  was blocked -- try a different (x, y) or direction.\n"
+)
+
+_CLICK_MENU_CARD = (
+    "You are playing a **menu / selection game** (CLICK_MENU class).\n"
+    "* Available actions are typically limited to ACTION5 (select/enter),\n"
+    "  ACTION6 (x, y click), ACTION7 (toggle/back/cycle), and RESET.\n"
+    "  Movement actions ACTION1-4 are inactive in this class.\n"
+    "* Strategy: navigate a menu/dialog UI. Click choices with ACTION6,\n"
+    "  confirm with ACTION5. ACTION7 may cycle options or back out.\n"
+    "* Look for highlighted, distinct, or differently-colored UI elements --\n"
+    "  these are the clickable items.\n"
+    "* Coordinates: x, y in [0, 63].\n"
+)
+
+_NAVIGATE_CARD = (
+    "You are playing a **movement / navigation game** (NAVIGATE class).\n"
+    "* Movement actions are primary: ACTION1=up, ACTION2=down,\n"
+    "  ACTION3=left, ACTION4=right.\n"
+    "* Other actions (5, 6, 7) likely do nothing or trigger special\n"
+    "  abilities (jump, attack, interact) depending on the game.\n"
+    "* Strategy: identify the player sprite and the goal / exit in the\n"
+    "  image. Plan a path toward the goal, avoiding obstacles (walls,\n"
+    "  traps, enemies).\n"
+    "* If the grid is unchanged after a move, you bumped into a wall or\n"
+    "  the move was blocked -- try a different direction.\n"
+    "* Some games have multiple levels; reaching the exit advances\n"
+    "  `levels_completed` by 1.\n"
+)
+
+
 GAME_CARDS: dict[str, str] = {
+    # PURE_CLICK class (>=70% ACTION6 observed in agent runs)
+    "tn36": _PURE_CLICK_CARD,
+    "s5i5": _PURE_CLICK_CARD,
+    "vc33": _PURE_CLICK_CARD,
+    # CLICK_OBJECT class (50-70% ACTION6 + some movement)
+    "cd82": _CLICK_OBJECT_CARD,
+    "dc22": _CLICK_OBJECT_CARD,
+    "ft09": _CLICK_OBJECT_CARD,
+    "re86": _CLICK_OBJECT_CARD,
+    "lp85": _CLICK_OBJECT_CARD,
+    "r11l": _CLICK_OBJECT_CARD,
+    "tr87": _CLICK_OBJECT_CARD,
+    "wa30": _CLICK_OBJECT_CARD,
+    "ka59": _CLICK_OBJECT_CARD,
+    # CLICK_MENU class (ACTION6 + ACTION5/7, no movement)
+    "sk48": _CLICK_MENU_CARD,
+    "sb26": _CLICK_MENU_CARD,
+    # NAVIGATE class (movement-dominant)
+    "cn04": _NAVIGATE_CARD,
+    "sp80": _NAVIGATE_CARD,
+    "ar25": _NAVIGATE_CARD,
+    "sc25": _NAVIGATE_CARD,
+    "bp35": _NAVIGATE_CARD,  # ACTION3/4 horizontal heavy, baseline 22-action level 1
+    # LOCKSMITH (specific to ls20, has expert replay for level 1)
     "ls20": (
         "You are playing **LockSmith**. Rules and strategy:\n"
         "* ACTION1=move up, ACTION2=move down, ACTION3=move left, "

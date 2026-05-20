@@ -37,6 +37,12 @@ from arcengine import FrameData, GameAction, GameState
 
 from ..agent import Agent
 from . import arc_game_state, arc_planner, arc_vision, cost_tracker
+# Phase C.3 was attempted (LLM hook on stuck-state via vision_v0 wrappers)
+# but reverted on 2026-05-20: subprocess-based vision calls hung 4-14 min
+# per call regardless of cwd choice (tmp -> Gemini "empty workspace" intro,
+# home -> Gemini analyses whole home dir before responding). Accept pure
+# A* + symbolic state as the hierarchical track; focus shifts to baseline
+# text-cascade with broader GAME_CARDS coverage.
 
 logger = logging.getLogger(__name__)
 
@@ -44,15 +50,24 @@ _FALLBACK_EXPLORE_ACTIONS = ["ACTION1", "ACTION2", "ACTION3", "ACTION4"]
 
 
 class NhArcHierarchicalV0(Agent):
-    """Vision + state + pathfinding. Zero LLM calls in MVP."""
+    """Vision + state + pathfinding. Pure A* navigation, zero LLM calls.
+
+    Phase C.2 design: symbolic perception (arc_vision) + game state
+    tracking (arc_game_state, with frame-diff player localisation) +
+    A* pathfinding (arc_planner). The MVP that validates whether the
+    symbolic stack alone can clear a level.
+
+    Phase C.3 vision-LLM hook was attempted and reverted: subprocess
+    vision calls hung 4-14 min regardless of cwd, with empty/unparseable
+    outputs in every fire. Pure A* remains the track here; LLM-driven
+    planning lives in nh_arc_baseline_v0 (text cascade with GAME_CARDS).
+    """
 
     MAX_ACTIONS: int = 80
     STUCK_REPLAN_THRESHOLD: int = 2  # blocked actions before replan
     LOG_DIR: str = "logs"
 
-    # Phase C.2 has no LLM, so no $ budget gate is needed; the field is
-    # kept for telemetry parity with the cascade agent.
-    BUDGET_HARD_USD: float = 0.0
+    BUDGET_HARD_USD: float = 0.0  # no LLM calls in this agent
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -121,6 +136,7 @@ class NhArcHierarchicalV0(Agent):
                     "-- discarding queue and replanning"
                 )
                 self._action_queue.clear()
+                self._plan = None  # force regen + LLM hook check in step 4
                 self._stuck_counter = 0
         else:
             self._stuck_counter = 0
@@ -192,6 +208,178 @@ class NhArcHierarchicalV0(Agent):
         if not hasattr(self, "_history"):
             self._history = []
         self._history.append(action_name)
+
+    # ------------------------------------------------------------------
+    # Phase C.3 vision LLM hook
+    # ------------------------------------------------------------------
+
+    def _maybe_invoke_llm_hook(self, latest_frame: FrameData) -> list[str]:
+        """Fire vision LLM hook if any trigger matches and budget remains.
+
+        Triggers (any):
+          (a) stuck-replan trigger: consecutive A* replans without level
+              progress >= LLM_TRIGGER_CONSECUTIVE_REPLANS.
+          (b) cold-start periodic trigger: after PERIODIC_FIRST_CALL_AT
+              actions, if no LLM call has fired and level == 0.
+          (c) refresh trigger: every PERIODIC_REFRESH_EVERY actions after
+              the last LLM call, if level == 0.
+
+        Returns parsed plan as a list of action name strings, or [] if
+        nothing should fire (or LLM returned nothing usable).
+        """
+        PERIODIC_FIRST_CALL_AT = 12   # cold-start: first hook after 12 actions
+        PERIODIC_REFRESH_EVERY = 18   # refresh every 18 actions on stuck level
+
+        if self._game_state is None:
+            return []
+        if self._llm_call_count >= self.LLM_HOOK_BUDGET:
+            return []
+        if self._budget_exceeded:
+            return []
+
+        trigger_a = (
+            self._consecutive_replans_without_progress
+            >= self.LLM_TRIGGER_CONSECUTIVE_REPLANS
+        )
+        trigger_b = (
+            self._llm_call_count == 0
+            and self.action_counter >= PERIODIC_FIRST_CALL_AT
+            and self._game_state.level == 0
+        )
+        trigger_c = (
+            self._llm_call_count > 0
+            and self._game_state.level == 0
+            and (self.action_counter - self._action_at_last_llm_call)
+            >= PERIODIC_REFRESH_EVERY
+        )
+
+        if not (trigger_a or trigger_b or trigger_c):
+            return []
+
+        png_path = self._frames_dir / f"{self.action_counter:03d}_stuck.png"
+        try:
+            arc_vision.render_frame_to_png(latest_frame.frame, png_path)
+        except Exception as e:
+            logger.warning(f"[HIER LLM HOOK] render failed: {e}")
+            return []
+
+        prompt = self._build_stuck_prompt(latest_frame)
+        text, latency = _call_claude_vision(
+            png_path, prompt, timeout=self.VISION_TIMEOUT_SECS
+        )
+        provider = "claude_vision"
+        cost = self.EST_COST_PER_CLAUDE_CALL_USD if text else 0.0
+
+        plan = _parse_plan(text, self.LLM_PLAN_LENGTH)
+        if not plan:
+            text, latency = _call_gemini_vision(
+                png_path, prompt, timeout=self.VISION_TIMEOUT_SECS * 2
+            )
+            provider = "gemini_vision"
+            cost = 0.0
+            plan = _parse_plan(text, self.LLM_PLAN_LENGTH)
+
+        self._llm_call_count += 1
+        self._action_at_last_llm_call = self.action_counter
+        self._game_cost_usd += cost
+        if self._game_cost_usd >= self.BUDGET_HARD_USD:
+            self._budget_exceeded = True
+            logger.warning(
+                f"[HIER BUDGET HARD STOP] ${self._game_cost_usd:.2f}"
+            )
+
+        try:
+            cost_tracker.record_call(
+                provider=provider,
+                model="sonnet" if provider == "claude_vision" else "gemini-flash-2.5",
+                usage={"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0},
+                duration_s=latency,
+                game_id=self.game_id,
+                action_counter=self.action_counter,
+                parse_ok=bool(plan),
+                status="winner" if plan else "empty",
+                caller_module="nh_arc_hierarchical_v0",
+                purpose="arc_stuck_hook",
+            )
+        except Exception:
+            pass
+
+        if not plan:
+            logger.warning(
+                f"[HIER LLM HOOK #{self._llm_call_count}] empty/unparseable "
+                f"from {provider} (latency {latency:.1f}s)"
+            )
+            return []
+
+        action_names: list[str] = []
+        for ga, data in plan:
+            if data:
+                # Skip ACTION6 with x,y for MVP -- hierarchical action_queue
+                # holds bare strings; data injection would need separate path.
+                continue
+            action_names.append(ga.name)
+
+        if not action_names:
+            logger.warning(
+                f"[HIER LLM HOOK #{self._llm_call_count}] plan was ACTION6-only "
+                f"from {provider}; dropped (MVP doesn't inject coords yet)"
+            )
+            return []
+
+        logger.warning(
+            f"[HIER LLM HOOK #{self._llm_call_count}/{self.LLM_HOOK_BUDGET}] "
+            f"{provider} -> {len(action_names)}-action plan injected: "
+            f"{action_names}"
+        )
+        return action_names
+
+    def _build_stuck_prompt(self, latest_frame: FrameData) -> str:
+        avail_names: list[str] = []
+        for aid in latest_frame.available_actions or []:
+            try:
+                avail_names.append(GameAction.from_id(aid).name)
+            except Exception:
+                pass
+        avail = ", ".join(avail_names) or (
+            "RESET, ACTION1, ACTION2, ACTION3, ACTION4, ACTION5, ACTION6, ACTION7"
+        )
+
+        card = _card_for_game(self.game_id)
+        card_block = f"\n# GAME-SPECIFIC NOTES\n{card}\n" if card else ""
+
+        state_info = "(no symbolic state available)"
+        if self._game_state is not None:
+            state_info = (
+                f"Player position: {self._game_state.player_pos}\n"
+                f"Door position:   {self._game_state.door_pos}\n"
+                f"Walls seen:      {len(self._game_state.walls_seen)}\n"
+                f"Level:           {self._game_state.level}\n"
+                f"Rotators:        {len(self._game_state.rotators)}\n"
+                f"Last action:     {self._game_state.last_action or '(none)'}\n"
+                f"Last succeeded:  {self._game_state.last_action_succeeded}\n"
+            )
+
+        return (
+            "# ROLE\n"
+            f"You see one frame of an ARC-AGI-3 game. The A* planner has been\n"
+            f"stuck for {self._consecutive_replans_without_progress} replans without "
+            "level progress.\n"
+            f"Look at the image, account for the symbolic state estimate (below),\n"
+            f"and suggest {self.LLM_PLAN_LENGTH} actions that might break the\n"
+            "deadlock. Prefer simple movement (ACTION1-4) over clicks (ACTION6)\n"
+            "for this hook -- coordinate clicks aren't wired in yet.\n"
+            f"{card_block}"
+            "\n"
+            "# CURRENT SYMBOLIC STATE\n"
+            f"{state_info}\n"
+            "# AVAILABLE ACTIONS\n"
+            f"{avail}\n"
+            "ACTION1=up, ACTION2=down, ACTION3=left, ACTION4=right.\n"
+            "\n"
+            "# OUTPUT FORMAT (strict)\n"
+            f"Reply with EXACTLY {self.LLM_PLAN_LENGTH} lines, one action token per\n"
+            "line, no prose, no markdown, no JSON. Use ACTION1-5 or ACTION7.\n"
+        )
 
     def _generate_plan(self) -> arc_planner.HierarchicalPlan:
         if self._game_state is None:

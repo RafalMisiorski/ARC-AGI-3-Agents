@@ -16,6 +16,7 @@ from .templates.multimodal import MultiModalLLM
 from .templates.nh_arc_baseline_v0 import NhArcBaselineV0  # operator addition
 from .templates.nh_arc_official_v0 import NhArcOfficialV0  # operator addition
 from .templates.nh_arc_hierarchical_v0 import NhArcHierarchicalV0  # operator addition
+from .templates.nh_arc_vision_v0 import NhArcVisionV0  # operator addition: per-action Claude multimodal
 from .templates.random_agent import Random
 from .templates.reasoning_agent import ReasoningAgent
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
