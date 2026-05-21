@@ -19,6 +19,7 @@ from .templates.nh_arc_hierarchical_v0 import NhArcHierarchicalV0  # operator ad
 from .templates.nh_arc_vision_v0 import NhArcVisionV0  # operator addition: per-action Claude multimodal
 from .templates.nh_arc_expert_replay_v0 import NhArcExpertReplayV0  # operator addition: hardcoded SDK validator
 from .templates.nh_arc_manual_v0 import NhArcManualV0  # operator addition: interactive REPL for ground truth
+from .templates.nh_arc_local_vlm_v0 import NhArcLocalVlmV0  # operator addition: offline Qwen2.5-VL-3B
 from .templates.random_agent import Random
 from .templates.reasoning_agent import ReasoningAgent
 from .templates.smolagents import SmolCodingAgent, SmolVisionAgent
